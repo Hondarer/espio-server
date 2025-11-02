@@ -7,6 +7,7 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "driver/rmt_tx.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -46,11 +47,13 @@ static const ble_uuid128_t gatt_svr_chr_adc_read_uuid =
 #define CMD_SET_OUTPUT_BLINK_500MS 4
 #define CMD_SET_OUTPUT_PWM 5
 #define CMD_SET_OUTPUT_ON_DISCONNECT 9
-#define CMD_SET_INPUT_FLOATING 11
-#define CMD_SET_INPUT_PULLUP 12
-#define CMD_SET_INPUT_PULLDOWN 13
-#define CMD_SET_ADC_ENABLE 21
-#define CMD_SET_ADC_DISABLE 22
+#define CMD_SET_OUTPUT_WS2812B_ENABLE 11
+#define CMD_SET_OUTPUT_WS2812B_BASECOLOR 12
+#define CMD_SET_INPUT_FLOATING 81
+#define CMD_SET_INPUT_PULLUP 82
+#define CMD_SET_INPUT_PULLDOWN 83
+#define CMD_SET_ADC_ENABLE 91
+#define CMD_SET_ADC_DISABLE 92
 
 // 内部用途予約 GPIO
 #define GPIO_AUTH_ENABLE 5  // 認証機能有効/無効 (LOW: 有効, HIGH: 無効)
@@ -60,12 +63,12 @@ static const ble_uuid128_t gatt_svr_chr_adc_read_uuid =
 #define MAX_USABLE_GPIO 22 // 使用可能な GPIO の総数 (GPIO4, GPIO5 を除く)
 
 // BLE ATT MTU 計算
-// WRITE データ構造: 1 (コマンド個数) + MAX_USABLE_GPIO * 4 (各コマンド 4 バイト)
+// WRITE データ構造: 1 (コマンド個数) + MAX_USABLE_GPIO * 6 (各コマンド 6 バイト)
 // ATT ヘッダ: 3 バイト (Opcode 1 + Attribute Handle 2)
-// 必要な MTU = ATT ヘッダ (3) + ペイロード (1 + 22 * 4) = 3 + 89 = 92 バイト
+// 必要な MTU = ATT ヘッダ (3) + ペイロード (1 + 22 * 6) = 3 + 133 = 136 バイト
 #define ATT_HEADER_SIZE 3
 #define COMMAND_HEADER_SIZE 1 // コマンド個数フィールド
-#define COMMAND_SIZE 4        // 各コマンドのサイズ (Pin + Command + Param1 + Param2)
+#define COMMAND_SIZE 6        // 各コマンドのサイズ (Pin + Command + Param1 + Param2 + Param3 + Param4)
 #define PAYLOAD_SIZE (COMMAND_HEADER_SIZE + (MAX_USABLE_GPIO * COMMAND_SIZE))
 #define REQUIRED_MTU (ATT_HEADER_SIZE + PAYLOAD_SIZE)
 
@@ -84,6 +87,15 @@ static const ble_uuid128_t gatt_svr_chr_adc_read_uuid =
 #define LEDC_TIMER_NUM LEDC_TIMER_0            // 使用するタイマー番号
 #define LEDC_SPEED_MODE LEDC_LOW_SPEED_MODE
 
+// WS2812B 設定
+#define WS2812B_MAX_LEDS 256                   // 1つの GPIO あたり最大 LED 数
+#define WS2812B_RMT_RESOLUTION_HZ 10000000     // RMT 解像度 10MHz (0.1us 刻み)
+#define WS2812B_T0H_TICKS 4                    // 0 ビット HIGH 時間 0.4us (4 × 0.1us)
+#define WS2812B_T0L_TICKS 9                    // 0 ビット LOW 時間 0.9us (9 × 0.1us)
+#define WS2812B_T1H_TICKS 8                    // 1 ビット HIGH 時間 0.8us (8 × 0.1us)
+#define WS2812B_T1L_TICKS 5                    // 1 ビット LOW 時間 0.5us (5 × 0.1us)
+#define WS2812B_RESET_US 50                    // リセット信号時間 50us
+
 // GPIO モード状態の定義
 typedef enum
 {
@@ -96,7 +108,8 @@ typedef enum
     BLEIO_MODE_BLINK_250MS,    // 250ms 点滅出力モード
     BLEIO_MODE_BLINK_500MS,    // 500ms 点滅出力モード
     BLEIO_MODE_PWM,            // PWM 出力モード
-    BLEIO_MODE_ADC             // ADC 入力モード
+    BLEIO_MODE_ADC,            // ADC 入力モード
+    BLEIO_MODE_WS2812B          // WS2812B シリアル LED 出力モード
 } bleio_mode_state_t;
 
 // PWM 設定保持用構造体
@@ -122,6 +135,16 @@ typedef struct
     bool calibrated;               // キャリブレーション済みか
     adc_cali_handle_t cali_handle; // キャリブレーションハンドル
 } adc_config_t;
+
+// WS2812B 設定保持用構造体
+typedef struct
+{
+    uint16_t num_leds;                  // LED 個数
+    uint8_t brightness;                 // 基準輝度 (0-255)
+    uint8_t *led_data;                  // LED データバッファ (GRB 形式、3 バイト × LED 個数)
+    rmt_channel_handle_t rmt_channel;   // RMT チャネルハンドル
+    rmt_encoder_handle_t rmt_encoder;   // RMT エンコーダハンドル
+} ws2812b_config_t;
 
 // GPIO ごとの状態管理
 typedef struct
@@ -178,6 +201,7 @@ static pwm_config_t pwm_configs[40] = {0};                        // 全 GPIO �
 static ledc_channel_info_t ledc_channels[LEDC_CHANNEL_MAX] = {0}; // LEDC チャネル管理
 static adc_config_t adc_configs[40] = {0};                        // 全 GPIO の ADC 設定
 static adc_oneshot_unit_handle_t adc1_handle = NULL;              // ADC1 ユニットハンドル
+static ws2812b_config_t ws2812b_configs[40] = {0};                  // 全 GPIO の WS2812B 設定
 static uint8_t global_blink_counter = 0;                          // 全 GPIO 共通の点滅カウンタ
 static esp_timer_handle_t blink_timer = NULL;
 static esp_timer_handle_t input_poll_timer = NULL;
@@ -350,12 +374,12 @@ static bool is_pairing_mode_requested(void)
 
 static void clear_bonding_info(void)
 {
-    ESP_LOGI(TAG, "ボンディング情報をクリアしています...");
+    ESP_LOGI(TAG, "Clearing bonding information...");
 
     // NimBLE のボンディング情報をクリア
     ble_store_clear();
 
-    ESP_LOGI(TAG, "ボンディング情報をクリアしました");
+    ESP_LOGI(TAG, "Bonding information cleared");
 }
 
 // GPIO 制御関数
@@ -509,13 +533,13 @@ static esp_err_t gpio_set_pwm(uint8_t pin, uint8_t duty_cycle, uint8_t freq_pres
     // パラメータ検証
     if (!is_valid_output_pin(pin))
     {
-        ESP_LOGE(TAG, "GPIO%d は PWM 出力に対応していません", pin);
+        ESP_LOGE(TAG, "GPIO%d does not support PWM output", pin);
         return ESP_ERR_INVALID_ARG;
     }
 
     if (freq_preset >= PWM_FREQ_TABLE_SIZE)
     {
-        ESP_LOGE(TAG, "無効な周波数プリセット: %d (最大: %d)", freq_preset, PWM_FREQ_TABLE_SIZE - 1);
+        ESP_LOGE(TAG, "Invalid frequency preset: %d (max: %d)", freq_preset, PWM_FREQ_TABLE_SIZE - 1);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -541,7 +565,7 @@ static esp_err_t gpio_set_pwm(uint8_t pin, uint8_t duty_cycle, uint8_t freq_pres
     int8_t channel = allocate_ledc_channel(pin);
     if (channel < 0)
     {
-        ESP_LOGE(TAG, "LEDC チャネルが不足しています (最大 %d チャネル)", LEDC_CHANNEL_MAX);
+        ESP_LOGE(TAG, "Insufficient LEDC channels (max: %d channels)", LEDC_CHANNEL_MAX);
         return ESP_ERR_NO_MEM;
     }
 
@@ -589,7 +613,7 @@ static esp_err_t gpio_set_pwm(uint8_t pin, uint8_t duty_cycle, uint8_t freq_pres
     gpio_states[pin].mode = BLEIO_MODE_PWM;
     portEXIT_CRITICAL(&gpio_states_mux);
 
-    ESP_LOGI(TAG, "GPIO%d を PWM 出力に設定しました (デューティ: %d/255 = %.1f%%, 周波数: %d Hz, チャネル: %d)",
+    ESP_LOGI(TAG, "Set GPIO%d to PWM output (duty: %d/255 = %.1f%%, freq: %d Hz, channel: %d)",
              pin, duty_cycle, (duty_cycle * 100.0) / 255.0, freq_hz, channel);
 
     return ESP_OK;
@@ -605,7 +629,7 @@ static void adc_module_init(void)
     esp_err_t ret = adc_oneshot_new_unit(&init_config, &adc1_handle);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "ADC1 ユニット初期化に失敗しました: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to initialize ADC1 unit: %s", esp_err_to_name(ret));
         return;
     }
 
@@ -639,13 +663,13 @@ static esp_err_t gpio_enable_adc(uint8_t pin, uint8_t atten_param)
     adc_channel_t channel = gpio_to_adc1_channel(pin);
     if (channel < 0)
     {
-        ESP_LOGE(TAG, "GPIO%d は ADC1 に対応していません (対応ピン: 32, 33, 34, 35, 36, 39)", pin);
+        ESP_LOGE(TAG, "GPIO%d does not support ADC1 (supported pins: 32, 33, 34, 35, 36, 39)", pin);
         return ESP_ERR_INVALID_ARG;
     }
 
     if (atten_param >= ADC_ATTEN_MAP_SIZE)
     {
-        ESP_LOGE(TAG, "無効な減衰率パラメータ: %d (最大: %d)", atten_param, ADC_ATTEN_MAP_SIZE - 1);
+        ESP_LOGE(TAG, "Invalid attenuation parameter: %d (max: %d)", atten_param, ADC_ATTEN_MAP_SIZE - 1);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -676,7 +700,7 @@ static esp_err_t gpio_enable_adc(uint8_t pin, uint8_t atten_param)
     esp_err_t ret = adc_oneshot_config_channel(adc1_handle, channel, &config);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "ADC チャネル設定に失敗しました: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to configure ADC channel: %s", esp_err_to_name(ret));
         return ret;
     }
 
@@ -703,8 +727,8 @@ static esp_err_t gpio_enable_adc(uint8_t pin, uint8_t atten_param)
                                     : (atten_param == 2)   ? "0-2.2V"
                                                            : "0-3.3V";
 
-    ESP_LOGI(TAG, "GPIO%d を ADC モードに設定しました (チャネル: %d, 減衰: %d dB, 範囲: %s, キャリブレーション: %s)",
-             pin, channel, atten_param, range_str, calibrated ? "成功" : "失敗");
+    ESP_LOGI(TAG, "Set GPIO%d to ADC mode (channel: %d, atten: %d dB, range: %s, calibration: %s)",
+             pin, channel, atten_param, range_str, calibrated ? "success" : "failed");
 
     return ESP_OK;
 }
@@ -717,7 +741,7 @@ static esp_err_t gpio_disable_adc(uint8_t pin)
 
     if (mode != BLEIO_MODE_ADC)
     {
-        ESP_LOGW(TAG, "GPIO%d は ADC モードではありません", pin);
+        ESP_LOGW(TAG, "GPIO%d is not in ADC mode", pin);
         return ESP_OK;
     }
 
@@ -736,7 +760,7 @@ static esp_err_t gpio_disable_adc(uint8_t pin)
     gpio_states[pin].mode = BLEIO_MODE_UNSET;
     portEXIT_CRITICAL(&gpio_states_mux);
 
-    ESP_LOGI(TAG, "GPIO%d の ADC モードを無効化しました", pin);
+    ESP_LOGI(TAG, "Disabled ADC mode on GPIO%d", pin);
     return ESP_OK;
 }
 
@@ -746,7 +770,7 @@ static uint16_t read_adc_value(uint8_t pin)
 
     if (config->channel < 0)
     {
-        ESP_LOGW(TAG, "GPIO%d は ADC モードではありません", pin);
+        ESP_LOGW(TAG, "GPIO%d is not in ADC mode", pin);
         return 0;
     }
 
@@ -755,7 +779,7 @@ static uint16_t read_adc_value(uint8_t pin)
     esp_err_t ret = adc_oneshot_read(adc1_handle, config->channel, &raw);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "GPIO%d の ADC 読み取りに失敗しました: %s", pin, esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to read ADC on GPIO%d: %s", pin, esp_err_to_name(ret));
         return 0;
     }
 
@@ -781,6 +805,376 @@ static uint16_t read_adc_value(uint8_t pin)
     return (uint16_t)raw;
 }
 
+// WS2812B 関連関数
+typedef struct {
+    rmt_encoder_t base;
+    rmt_encoder_t *bytes_encoder;
+    rmt_encoder_t *copy_encoder;
+    rmt_symbol_word_t ws2812b_bit0;
+    rmt_symbol_word_t ws2812b_bit1;
+} ws2812b_encoder_t;
+
+static size_t ws2812b_encoder_encode(rmt_encoder_t *encoder, rmt_channel_handle_t channel,
+                                     const void *primary_data, size_t data_size, rmt_encode_state_t *ret_state)
+{
+    ws2812b_encoder_t *ws2812b_encoder = __containerof(encoder, ws2812b_encoder_t, base);
+    rmt_encoder_handle_t bytes_encoder = ws2812b_encoder->bytes_encoder;
+    rmt_encode_state_t session_state = RMT_ENCODING_RESET;
+    size_t encoded_symbols = 0;
+
+    // エンコード処理
+    encoded_symbols += bytes_encoder->encode(bytes_encoder, channel, primary_data, data_size, &session_state);
+
+    *ret_state = session_state;
+    return encoded_symbols;
+}
+
+static esp_err_t ws2812b_encoder_reset(rmt_encoder_t *encoder)
+{
+    ws2812b_encoder_t *ws2812b_encoder = __containerof(encoder, ws2812b_encoder_t, base);
+    rmt_encoder_reset(ws2812b_encoder->bytes_encoder);
+    rmt_encoder_reset(ws2812b_encoder->copy_encoder);
+    return ESP_OK;
+}
+
+static esp_err_t ws2812b_encoder_del(rmt_encoder_t *encoder)
+{
+    ws2812b_encoder_t *ws2812b_encoder = __containerof(encoder, ws2812b_encoder_t, base);
+    rmt_del_encoder(ws2812b_encoder->bytes_encoder);
+    rmt_del_encoder(ws2812b_encoder->copy_encoder);
+    free(ws2812b_encoder);
+    return ESP_OK;
+}
+
+static esp_err_t ws2812b_encoder_new(rmt_encoder_handle_t *ret_encoder)
+{
+    ws2812b_encoder_t *ws2812b_encoder = calloc(1, sizeof(ws2812b_encoder_t));
+    if (ws2812b_encoder == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ws2812b_encoder->base.encode = ws2812b_encoder_encode;
+    ws2812b_encoder->base.reset = ws2812b_encoder_reset;
+    ws2812b_encoder->base.del = ws2812b_encoder_del;
+
+    // 0 ビットと 1 ビットのシンボル定義
+    ws2812b_encoder->ws2812b_bit0.level0 = 1;
+    ws2812b_encoder->ws2812b_bit0.duration0 = WS2812B_T0H_TICKS;
+    ws2812b_encoder->ws2812b_bit0.level1 = 0;
+    ws2812b_encoder->ws2812b_bit0.duration1 = WS2812B_T0L_TICKS;
+
+    ws2812b_encoder->ws2812b_bit1.level0 = 1;
+    ws2812b_encoder->ws2812b_bit1.duration0 = WS2812B_T1H_TICKS;
+    ws2812b_encoder->ws2812b_bit1.level1 = 0;
+    ws2812b_encoder->ws2812b_bit1.duration1 = WS2812B_T1L_TICKS;
+
+    // バイトエンコーダの作成
+    rmt_bytes_encoder_config_t bytes_encoder_config = {
+        .bit0 = ws2812b_encoder->ws2812b_bit0,
+        .bit1 = ws2812b_encoder->ws2812b_bit1,
+        .flags.msb_first = 1
+    };
+    esp_err_t ret = rmt_new_bytes_encoder(&bytes_encoder_config, &ws2812b_encoder->bytes_encoder);
+    if (ret != ESP_OK)
+    {
+        free(ws2812b_encoder);
+        return ret;
+    }
+
+    // コピーエンコーダの作成
+    rmt_copy_encoder_config_t copy_encoder_config = {};
+    ret = rmt_new_copy_encoder(&copy_encoder_config, &ws2812b_encoder->copy_encoder);
+    if (ret != ESP_OK)
+    {
+        rmt_del_encoder(ws2812b_encoder->bytes_encoder);
+        free(ws2812b_encoder);
+        return ret;
+    }
+
+    *ret_encoder = &ws2812b_encoder->base;
+    return ESP_OK;
+}
+
+static esp_err_t ws2812b_turn_off_all_leds(uint8_t pin)
+{
+    portENTER_CRITICAL(&gpio_states_mux);
+    bleio_mode_state_t mode = gpio_states[pin].mode;
+    portEXIT_CRITICAL(&gpio_states_mux);
+
+    if (mode != BLEIO_MODE_WS2812B)
+    {
+        ESP_LOGW(TAG, "GPIO%d is not in WS2812B mode", pin);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ws2812b_config_t *config = &ws2812b_configs[pin];
+
+    if (config->led_data == NULL || config->rmt_channel == NULL || config->rmt_encoder == NULL)
+    {
+        ESP_LOGE(TAG, "WS2812B configuration for GPIO%d is invalid", pin);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // LED データバッファをすべて 0 にクリア (すべて消灯)
+    memset(config->led_data, 0, config->num_leds * 3);
+
+    // 消灯データを送信
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,
+    };
+
+    esp_err_t ret = rmt_transmit(config->rmt_channel, config->rmt_encoder,
+                                  config->led_data, config->num_leds * 3, &tx_config);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to send WS2812B turn-off data on GPIO%d: %s", pin, esp_err_to_name(ret));
+        return ret;
+    }
+
+    // 送信完了を待つ
+    ret = rmt_tx_wait_all_done(config->rmt_channel, 100);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "WS2812B turn-off data transmission wait timeout on GPIO%d", pin);
+    }
+
+    ESP_LOGI(TAG, "Turned off all WS2812B LEDs on GPIO%d (mode maintained)", pin);
+    return ESP_OK;
+}
+
+static void stop_ws2812b_if_active(uint8_t pin)
+{
+    portENTER_CRITICAL(&gpio_states_mux);
+    bleio_mode_state_t mode = gpio_states[pin].mode;
+    portEXIT_CRITICAL(&gpio_states_mux);
+
+    if (mode == BLEIO_MODE_WS2812B)
+    {
+        ws2812b_config_t *config = &ws2812b_configs[pin];
+
+        // WS2812B モードを無効化する前に、すべての LED を消灯する
+        if (config->led_data != NULL && config->rmt_channel != NULL && config->rmt_encoder != NULL)
+        {
+            // LED データバッファをすべて 0 にクリア (すべて消灯)
+            memset(config->led_data, 0, config->num_leds * 3);
+
+            // 消灯データを送信
+            rmt_transmit_config_t tx_config = {
+                .loop_count = 0,
+            };
+
+            esp_err_t ret = rmt_transmit(config->rmt_channel, config->rmt_encoder,
+                                          config->led_data, config->num_leds * 3, &tx_config);
+            if (ret == ESP_OK)
+            {
+                // 送信完了を待つ
+                rmt_tx_wait_all_done(config->rmt_channel, 100);
+                ESP_LOGI(TAG, "Turned off all WS2812B LEDs on GPIO%d", pin);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Failed to send WS2812B turn-off data on GPIO%d: %s", pin, esp_err_to_name(ret));
+            }
+        }
+
+        // RMT チャネルとエンコーダを削除
+        if (config->rmt_channel != NULL)
+        {
+            rmt_disable(config->rmt_channel);
+            rmt_del_channel(config->rmt_channel);
+            config->rmt_channel = NULL;
+        }
+
+        if (config->rmt_encoder != NULL)
+        {
+            rmt_del_encoder(config->rmt_encoder);
+            config->rmt_encoder = NULL;
+        }
+
+        // LED データバッファを解放
+        if (config->led_data != NULL)
+        {
+            free(config->led_data);
+            config->led_data = NULL;
+        }
+
+        config->num_leds = 0;
+        config->brightness = 0;
+
+        portENTER_CRITICAL(&gpio_states_mux);
+        gpio_states[pin].mode = BLEIO_MODE_UNSET;
+        portEXIT_CRITICAL(&gpio_states_mux);
+
+        ESP_LOGI(TAG, "Stopped WS2812B on GPIO%d", pin);
+    }
+}
+
+static esp_err_t gpio_enable_ws2812b(uint8_t pin, uint16_t num_leds, uint8_t brightness)
+{
+    // パラメータ検証
+    if (!is_valid_output_pin(pin))
+    {
+        ESP_LOGE(TAG, "GPIO%d does not support WS2812B output", pin);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (num_leds == 0 || num_leds > WS2812B_MAX_LEDS)
+    {
+        ESP_LOGE(TAG, "Invalid LED count: %d (range: 1-%d)", num_leds, WS2812B_MAX_LEDS);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 既存のモードをクリーンアップ
+    stop_pwm_if_active(pin);
+    stop_adc_if_active(pin);
+    stop_ws2812b_if_active(pin);
+
+    // LED データバッファを確保 (GRB 形式、3 バイト × LED 個数)
+    uint8_t *led_data = (uint8_t *)calloc(num_leds * 3, sizeof(uint8_t));
+    if (led_data == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate LED data buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // RMT チャネルの設定
+    rmt_tx_channel_config_t tx_chan_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .gpio_num = pin,
+        .mem_block_symbols = 64,
+        .resolution_hz = WS2812B_RMT_RESOLUTION_HZ,
+        .trans_queue_depth = 4,
+    };
+
+    rmt_channel_handle_t rmt_channel = NULL;
+    esp_err_t ret = rmt_new_tx_channel(&tx_chan_config, &rmt_channel);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to create RMT channel: %s", esp_err_to_name(ret));
+        free(led_data);
+        return ret;
+    }
+
+    // エンコーダの作成
+    rmt_encoder_handle_t rmt_encoder = NULL;
+    ret = ws2812b_encoder_new(&rmt_encoder);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to create WS2812B encoder: %s", esp_err_to_name(ret));
+        rmt_del_channel(rmt_channel);
+        free(led_data);
+        return ret;
+    }
+
+    // RMT チャネルを有効化
+    ret = rmt_enable(rmt_channel);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to enable RMT channel: %s", esp_err_to_name(ret));
+        rmt_del_encoder(rmt_encoder);
+        rmt_del_channel(rmt_channel);
+        free(led_data);
+        return ret;
+    }
+
+    // 設定を保存
+    ws2812b_configs[pin].num_leds = num_leds;
+    ws2812b_configs[pin].brightness = brightness;
+    ws2812b_configs[pin].led_data = led_data;
+    ws2812b_configs[pin].rmt_channel = rmt_channel;
+    ws2812b_configs[pin].rmt_encoder = rmt_encoder;
+
+    portENTER_CRITICAL(&gpio_states_mux);
+    gpio_states[pin].mode = BLEIO_MODE_WS2812B;
+    portEXIT_CRITICAL(&gpio_states_mux);
+
+    // 初期状態としてすべての LED を消灯 (RGB = 0, 0, 0) にする
+    // led_data は calloc で 0 初期化されているので、そのまま送信
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,
+    };
+
+    ret = rmt_transmit(rmt_channel, rmt_encoder, led_data, num_leds * 3, &tx_config);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to send WS2812B initialization data: %s", esp_err_to_name(ret));
+        // エラーでも継続 (次回のコマンドで送信できる可能性がある)
+    }
+    else
+    {
+        // 送信完了を待つ
+        ret = rmt_tx_wait_all_done(rmt_channel, 100);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "WS2812B initialization data transmission wait timeout");
+        }
+    }
+
+    ESP_LOGI(TAG, "Set GPIO%d to WS2812B output (LED count: %d, brightness: %d/255 = %.1f%%, initial state: all off)",
+             pin, num_leds, brightness, (brightness * 100.0) / 255.0);
+
+    return ESP_OK;
+}
+
+static esp_err_t gpio_set_ws2812b_color(uint8_t pin, uint16_t led_index, uint8_t r, uint8_t g, uint8_t b)
+{
+    portENTER_CRITICAL(&gpio_states_mux);
+    bleio_mode_state_t mode = gpio_states[pin].mode;
+    portEXIT_CRITICAL(&gpio_states_mux);
+
+    if (mode != BLEIO_MODE_WS2812B)
+    {
+        ESP_LOGE(TAG, "GPIO%d is not in WS2812B mode", pin);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ws2812b_config_t *config = &ws2812b_configs[pin];
+
+    // LED 番号は 1 から始まる (1-indexed)
+    if (led_index < 1 || led_index > config->num_leds)
+    {
+        ESP_LOGE(TAG, "Invalid LED index: %d (valid range: 1-%d)", led_index, config->num_leds);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 輝度を適用
+    uint32_t r_scaled = (r * config->brightness) / 255;
+    uint32_t g_scaled = (g * config->brightness) / 255;
+    uint32_t b_scaled = (b * config->brightness) / 255;
+
+    // GRB 形式で保存 (配列アクセスは 0-indexed なので -1)
+    uint32_t offset = (led_index - 1) * 3;
+    config->led_data[offset + 0] = (uint8_t)g_scaled;
+    config->led_data[offset + 1] = (uint8_t)r_scaled;
+    config->led_data[offset + 2] = (uint8_t)b_scaled;
+
+    // データを送信
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,
+    };
+
+    esp_err_t ret = rmt_transmit(config->rmt_channel, config->rmt_encoder,
+                                   config->led_data, config->num_leds * 3, &tx_config);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to send WS2812B data: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // 送信完了を待つ
+    ret = rmt_tx_wait_all_done(config->rmt_channel, 100);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "WS2812B transmission wait timeout");
+    }
+
+    ESP_LOGI(TAG, "Set LED%d on GPIO%d (R=%d, G=%d, B=%d → R=%d, G=%d, B=%d)",
+             led_index, pin, r, g, b, (uint8_t)r_scaled, (uint8_t)g_scaled, (uint8_t)b_scaled);
+
+    return ESP_OK;
+}
+
 static esp_err_t gpio_set_mode(uint8_t pin, uint8_t command, uint8_t latch_mode)
 {
     if (!is_valid_gpio(pin))
@@ -794,6 +1188,9 @@ static esp_err_t gpio_set_mode(uint8_t pin, uint8_t command, uint8_t latch_mode)
 
     // ADC が有効な場合は停止
     stop_adc_if_active(pin);
+
+    // WS2812B が有効な場合は停止
+    stop_ws2812b_if_active(pin);
 
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << pin);
@@ -864,6 +1261,9 @@ static esp_err_t gpio_write_level(uint8_t pin, uint8_t command)
     // ADC が有効な場合は停止
     stop_adc_if_active(pin);
 
+    // WS2812B が有効な場合は停止
+    stop_ws2812b_if_active(pin);
+
     // GPIO を出力モードに設定
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << pin);
@@ -915,6 +1315,9 @@ static esp_err_t gpio_start_blink(uint8_t pin, uint8_t command)
 
     // ADC が有効な場合は停止
     stop_adc_if_active(pin);
+
+    // WS2812B が有効な場合は停止
+    stop_ws2812b_if_active(pin);
 
     // GPIO を出力モードに設定
     gpio_config_t io_conf = {};
@@ -971,8 +1374,8 @@ static esp_err_t gpio_set_disconnect_behavior(uint8_t pin, uint8_t behavior)
     gpio_states[pin].disconnect_behavior = behavior;
     portEXIT_CRITICAL(&gpio_states_mux);
 
-    const char *behavior_str = (behavior == 0) ? "維持" : (behavior == 1) ? "LOW" : "HIGH";
-    ESP_LOGI(TAG, "GPIO%d の切断時の振る舞いを設定: %s", pin, behavior_str);
+    const char *behavior_str = (behavior == 0) ? "MAINTAIN" : (behavior == 1) ? "LOW" : "HIGH";
+    ESP_LOGI(TAG, "Set disconnect behavior for GPIO%d: %s", pin, behavior_str);
 
     return ESP_OK;
 }
@@ -989,10 +1392,10 @@ static int gatt_svr_chr_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     struct os_mbuf *om = ctxt->om;
     uint16_t len = OS_MBUF_PKTLEN(om);
 
-    // 最小長チェック: 1 (コマンド個数) + 4 (最低1コマンド)
-    if (len < 5)
+    // 最小長チェック: 1 (コマンド個数) + 6 (最低1コマンド)
+    if (len < 7)
     {
-        ESP_LOGE(TAG, "Invalid write length: %d (minimum 5)", len);
+        ESP_LOGE(TAG, "Invalid write length: %d (minimum 7)", len);
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
 
@@ -1000,7 +1403,7 @@ static int gatt_svr_chr_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     os_mbuf_copydata(om, 0, 1, &cmd_count);
 
     // パケット長チェック
-    uint16_t expected_len = 1 + (cmd_count * 4);
+    uint16_t expected_len = 1 + (cmd_count * 6);
     if (len != expected_len)
     {
         ESP_LOGE(TAG, "Invalid packet length: %d (expected %d for %d commands)",
@@ -1013,16 +1416,18 @@ static int gatt_svr_chr_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     // 各コマンドを処理
     for (int i = 0; i < cmd_count; i++)
     {
-        uint8_t cmd_data[4];
-        os_mbuf_copydata(om, 1 + (i * 4), 4, cmd_data);
+        uint8_t cmd_data[6];
+        os_mbuf_copydata(om, 1 + (i * 6), 6, cmd_data);
 
         uint8_t pin = cmd_data[0];
         uint8_t command = cmd_data[1];
         uint8_t param1 = cmd_data[2];
         uint8_t param2 = cmd_data[3];
+        uint8_t param3 = cmd_data[4];
+        uint8_t param4 = cmd_data[5];
 
-        ESP_LOGI(TAG, "Command %d: pin=%d, command=%d, param1=%d, param2=%d",
-                 i + 1, pin, command, param1, param2);
+        ESP_LOGI(TAG, "Command %d: pin=%d, command=%d, param1=%d, param2=%d, param3=%d, param4=%d",
+                 i + 1, pin, command, param1, param2, param3, param4);
 
         esp_err_t ret;
         if (command == CMD_SET_OUTPUT_LOW || command == CMD_SET_OUTPUT_HIGH)
@@ -1040,6 +1445,20 @@ static int gatt_svr_chr_write_cb(uint16_t conn_handle, uint16_t attr_handle,
         else if (command == CMD_SET_OUTPUT_ON_DISCONNECT)
         {
             ret = gpio_set_disconnect_behavior(pin, param1); // param1 = disconnect_behavior
+        }
+        else if (command == CMD_SET_OUTPUT_WS2812B_ENABLE)
+        {
+            uint16_t num_leds = param1;
+            uint8_t brightness = (param2 == 0) ? 255 : param2; // 0 の場合は 100% (255)
+            ret = gpio_enable_ws2812b(pin, num_leds, brightness); // param1 = num_leds, param2 = brightness
+        }
+        else if (command == CMD_SET_OUTPUT_WS2812B_BASECOLOR)
+        {
+            uint16_t led_index = param1;
+            uint8_t r = param2;
+            uint8_t g = param3;
+            uint8_t b = param4;
+            ret = gpio_set_ws2812b_color(pin, led_index, r, g, b); // param1 = led_index, param2-4 = RGB
         }
         else if (command >= CMD_SET_INPUT_FLOATING && command <= CMD_SET_INPUT_PULLDOWN)
         {
@@ -1268,22 +1687,37 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             portEXIT_CRITICAL(&gpio_states_mux);
 
             // 出力モードかつ切断時の振る舞いが設定されている場合
-            if ((mode == BLEIO_MODE_OUTPUT_LOW || mode == BLEIO_MODE_OUTPUT_HIGH ||
-                 mode == BLEIO_MODE_BLINK_250MS || mode == BLEIO_MODE_BLINK_500MS ||
-                 mode == BLEIO_MODE_PWM) &&
-                disconnect_behavior != 0)
+            if (disconnect_behavior != 0)
             {
-                if (disconnect_behavior == 1)
+                if (mode == BLEIO_MODE_WS2812B)
                 {
-                    // LOW に設定
-                    gpio_write_level(pin, CMD_SET_OUTPUT_LOW);
-                    ESP_LOGI(TAG, "切断したため GPIO%d を LOW に設定しました", pin);
+                    // WS2812B モードの場合
+                    if (disconnect_behavior == 1)
+                    {
+                        // すべての LED を消灯 (モードは維持)
+                        ws2812b_turn_off_all_leds(pin);
+                        ESP_LOGI(TAG, "Turned off all WS2812B LEDs on GPIO%d due to disconnect", pin);
+                    }
+                    // disconnect_behavior == 2 の場合は何もしない (状態を維持)
+                    // disconnect_behavior == 0 の場合もここには来ない (上の if で弾かれる)
                 }
-                else if (disconnect_behavior == 2)
+                else if (mode == BLEIO_MODE_OUTPUT_LOW || mode == BLEIO_MODE_OUTPUT_HIGH ||
+                         mode == BLEIO_MODE_BLINK_250MS || mode == BLEIO_MODE_BLINK_500MS ||
+                         mode == BLEIO_MODE_PWM)
                 {
-                    // HIGH に設定
-                    gpio_write_level(pin, CMD_SET_OUTPUT_HIGH);
-                    ESP_LOGI(TAG, "切断したため GPIO%d を HIGH に設定しました", pin);
+                    // その他の出力モードの場合
+                    if (disconnect_behavior == 1)
+                    {
+                        // LOW に設定
+                        gpio_write_level(pin, CMD_SET_OUTPUT_LOW);
+                        ESP_LOGI(TAG, "Set GPIO%d to LOW due to disconnect", pin);
+                    }
+                    else if (disconnect_behavior == 2)
+                    {
+                        // HIGH に設定
+                        gpio_write_level(pin, CMD_SET_OUTPUT_HIGH);
+                        ESP_LOGI(TAG, "Set GPIO%d to HIGH due to disconnect", pin);
+                    }
                 }
             }
         }
@@ -1457,23 +1891,23 @@ void app_main(void)
 
     if (auth_mode_enabled)
     {
-        ESP_LOGI(TAG, "認証機能が有効です (GPIO%d = LOW)", GPIO_AUTH_ENABLE);
+        ESP_LOGI(TAG, "Authentication enabled (GPIO%d = LOW)", GPIO_AUTH_ENABLE);
 
         // ペアリングモードのチェック (認証有効時のみ)
         bool pairing_mode = is_pairing_mode_requested();
 
         if (pairing_mode)
         {
-            ESP_LOGI(TAG, "ペアリングモードで起動します (GPIO%d = LOW) - ボンディング情報をクリアします", GPIO_PAIRING_MODE);
+            ESP_LOGI(TAG, "Starting in pairing mode (GPIO%d = LOW) - clearing bonding information", GPIO_PAIRING_MODE);
         }
         else
         {
-            ESP_LOGI(TAG, "認証有効モードで起動します (GPIO%d = HIGH)", GPIO_PAIRING_MODE);
+            ESP_LOGI(TAG, "Starting in authentication mode (GPIO%d = HIGH)", GPIO_PAIRING_MODE);
         }
     }
     else
     {
-        ESP_LOGI(TAG, "認証機能が無効です (GPIO%d = HIGH)", GPIO_AUTH_ENABLE);
+        ESP_LOGI(TAG, "Authentication disabled (GPIO%d = HIGH)", GPIO_AUTH_ENABLE);
     }
 
     // NimBLE 初期化
@@ -1505,7 +1939,7 @@ void app_main(void)
     }
 
     // ATT MTU を設定 (最大 22 コマンドまで送信可能)
-    // 必要 MTU = ATT ヘッダ (3) + コマンド個数 (1) + コマンド (22 * 4) = 92 バイト
+    // 必要 MTU = ATT ヘッダ (3) + コマンド個数 (1) + コマンド (22 * 6) = 136 バイト
     ble_att_set_preferred_mtu(REQUIRED_MTU);
     ESP_LOGI(TAG, "Set preferred MTU to %d bytes (max %d commands, payload %d bytes)",
              REQUIRED_MTU, MAX_USABLE_GPIO, PAYLOAD_SIZE);
