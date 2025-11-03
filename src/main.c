@@ -102,6 +102,7 @@ static const ble_uuid128_t gatt_svr_chr_adc_read_uuid =
 #define WS2812B_PATTERN_BLINK_250MS 1   // 250ms 点灯 / 250ms 消灯
 #define WS2812B_PATTERN_BLINK_500MS 2   // 500ms 点灯 / 500ms 消灯
 #define WS2812B_PATTERN_RAINBOW 3       // 虹色パターン
+#define WS2812B_PATTERN_FLICKER 4       // 炎のゆらめきパターン
 #define WS2812B_PATTERN_UNSET 0xFF      // 未設定 (個別 LED パターン用)
 
 // GPIO モード状態の定義
@@ -147,11 +148,25 @@ typedef struct
 // WS2812B LED 個別パターン設定構造体
 typedef struct
 {
-    uint8_t pattern_type;   // パターンタイプ (0-3, 0xFF=未設定)
-    uint8_t pattern_param1; // パラメータ1 (RAINBOW: 色相が一周する LED 個数)
-    uint8_t pattern_param2; // パラメータ2 (RAINBOW: 変化スピード)
+    uint8_t pattern_type;   // パターンタイプ (0-4, 0xFF=未設定)
+    uint8_t pattern_param1; // パラメータ1 (RAINBOW: 色相が一周する LED 個数、FLICKER: ゆらめきの速度)
+    uint8_t pattern_param2; // パラメータ2 (RAINBOW: 変化スピード、FLICKER: ゆらめきの変化幅)
     uint16_t hue;           // RAINBOW 用の現在色相 (0-65535)
 } ws2812b_led_pattern_t;
+
+// WS2812B FLICKER パターン用のデータ構造
+typedef struct
+{
+    uint16_t base_hue;      // 基準色の色相 (キャッシュ)
+    uint8_t base_sat;       // 基準色の彩度 (キャッシュ)
+    uint8_t base_val;       // 基準色の明度 (キャッシュ)
+    uint32_t seed;          // 疑似乱数の状態
+    uint8_t val_ema;        // 明度の平滑値 (現在値) 0-255
+    uint16_t hue_ema;       // 色相の平滑値 (現在値) 0-65535
+    uint8_t val_target;     // 明度の目標値 0-255
+    uint16_t hue_target;    // 色相の目標値 0-65535
+    uint8_t tick;           // ローカルの間引きカウンタ
+} led_flicker_data_t;
 
 // WS2812B 設定保持用構造体
 typedef struct
@@ -166,6 +181,7 @@ typedef struct
     ws2812b_led_pattern_t gpio_pattern; // GPIO 全体のデフォルトパターン (LED 番号 0)
     ws2812b_led_pattern_t *led_patterns; // LED 個別のパターン配列 (num_leds 個、動的割り当て)
     uint8_t *base_colors;               // LED ごとのベースカラー (RGB 形式、3 バイト × num_leds)
+    led_flicker_data_t *flicker_data;   // FLICKER パターン用のデータ (num_leds 個、動的割り当て)
 } ws2812b_config_t;
 
 // GPIO ごとの状態管理
@@ -329,6 +345,73 @@ static inline uint32_t gamma32(uint32_t rgb)
     b = gamma8[b];
 
     return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+/**
+ * @brief RGB 色空間から HSV 色空間への変換
+ *
+ * @param r 赤 (0-255)
+ * @param g 緑 (0-255)
+ * @param b 青 (0-255)
+ * @param h 色相 (0-65535) への出力ポインタ
+ * @param s 彩度 (0-255) への出力ポインタ
+ * @param v 明度 (0-255) への出力ポインタ
+ */
+static void rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b,
+                       uint16_t *h, uint8_t *s, uint8_t *v)
+{
+    uint8_t max = (r > g) ? ((r > b) ? r : b) : ((g > b) ? g : b);
+    uint8_t min = (r < g) ? ((r < b) ? r : b) : ((g < b) ? g : b);
+    uint8_t delta = max - min;
+
+    *v = max;
+
+    if (max == 0)
+    {
+        *s = 0;
+        *h = 0;
+        return;
+    }
+
+    *s = (uint32_t)delta * 255 / max;
+
+    if (delta == 0)
+    {
+        *h = 0;
+        return;
+    }
+
+    int32_t hue;
+    if (max == r)
+    {
+        hue = ((int32_t)(g - b) * 65536) / (6 * delta);
+        if (hue < 0)
+            hue += 65536;
+    }
+    else if (max == g)
+    {
+        hue = (65536 / 3) + ((int32_t)(b - r) * 65536) / (6 * delta);
+    }
+    else
+    {
+        hue = (65536 * 2 / 3) + ((int32_t)(r - g) * 65536) / (6 * delta);
+    }
+
+    *h = (uint16_t)(hue & 0xFFFF);
+}
+
+/**
+ * @brief 疑似乱数生成 (線形合同法)
+ *
+ * @param state 疑似乱数の状態 (入出力)
+ * @return uint8_t 疑似乱数 (0-255)
+ */
+static uint8_t flicker_rand(uint32_t *state)
+{
+    // 線形合同法: seed = (a * seed + c) mod m
+    // a=1103515245, c=12345, m=2^31
+    *state = (*state * 1103515245 + 12345) & 0x7FFFFFFF;
+    return (*state >> 16) & 0xFF;
 }
 
 /**
@@ -547,6 +630,135 @@ static void update_ws2812b_patterns(void)
                 break;
             }
 
+            case WS2812B_PATTERN_FLICKER:
+            {
+                // FLICKER パターンは毎回更新
+                update_this_led = true;
+
+                // 基準色を取得
+                uint8_t base_r = 0, base_g = 0, base_b = 0;
+                if (config->base_colors != NULL)
+                {
+                    base_r = config->base_colors[led_idx * 3];
+                    base_g = config->base_colors[led_idx * 3 + 1];
+                    base_b = config->base_colors[led_idx * 3 + 2];
+                }
+
+                // flicker_data が未確保の場合は確保
+                if (config->flicker_data == NULL)
+                {
+                    config->flicker_data = (led_flicker_data_t *)calloc(config->num_leds, sizeof(led_flicker_data_t));
+                    if (config->flicker_data == NULL)
+                    {
+                        ESP_LOGE(TAG, "Failed to allocate flicker_data");
+                        break;
+                    }
+
+                    // 各 LED の flicker_data を初期化
+                    for (uint16_t i = 0; i < config->num_leds; i++)
+                    {
+                        // 疑似乱数のシードを初期化 (LED インデックスとシステム時刻から)
+                        config->flicker_data[i].seed = (i * 12345 + esp_timer_get_time() / 1000) & 0x7FFFFFFF;
+
+                        // 基準色の HSV を計算してキャッシュ
+                        uint8_t br = config->base_colors ? config->base_colors[i * 3] : 0;
+                        uint8_t bg = config->base_colors ? config->base_colors[i * 3 + 1] : 0;
+                        uint8_t bb = config->base_colors ? config->base_colors[i * 3 + 2] : 0;
+                        rgb_to_hsv(br, bg, bb,
+                                   &config->flicker_data[i].base_hue,
+                                   &config->flicker_data[i].base_sat,
+                                   &config->flicker_data[i].base_val);
+
+                        // フィールドの初期値 (EMA と目標値は現在の基準に合わせる)
+                        config->flicker_data[i].val_ema = config->flicker_data[i].base_val;
+                        config->flicker_data[i].hue_ema = config->flicker_data[i].base_hue;
+                        config->flicker_data[i].val_target = config->flicker_data[i].base_val;
+                        config->flicker_data[i].hue_target = config->flicker_data[i].base_hue;
+                        config->flicker_data[i].tick = 0;
+                    }
+                }
+
+                // 基準色が変更された可能性があるので、RGB → HSV 変換を実行してキャッシュを更新
+                rgb_to_hsv(base_r, base_g, base_b,
+                           &config->flicker_data[led_idx].base_hue,
+                           &config->flicker_data[led_idx].base_sat,
+                           &config->flicker_data[led_idx].base_val);
+
+                // パラメータ取得
+                uint8_t speed = pattern->pattern_param1;   // 1..255 (0 のときはデフォルト)
+                if (speed == 0) speed = 128;
+                uint8_t range = pattern->pattern_param2;   // 1..255 (0 のときはデフォルト)
+                if (range == 0) range = 128;
+
+                // 速度からローパス係数を作る (0.06 .. 0.18 程度)
+                float alpha_base = 0.06f + 0.12f * ((float)speed / 255.0f);
+
+                // 目標値の更新は 40〜80[ms] 程度に間引く (tick で管理)
+                led_flicker_data_t *fd = &config->flicker_data[led_idx];
+                uint8_t tick_div = (speed < 128) ? 8 : 6;   // 遅いときは間引きを強める
+                if (++fd->tick >= tick_div) {
+                    fd->tick = 0;
+
+                    // 小さなランダムウォーク目標 (時間相関を持つ入力)
+                    int16_t dv = ((int)flicker_rand(&fd->seed) - 128) * (int)range / 512;   // 明度の揺れ
+                    int16_t dh = ((int)flicker_rand(&fd->seed) - 128) * (int)range / 4096;  // 色相の揺れは小さめ
+
+                    int v_target = (int)fd->base_val + dv;
+                    int h_target = (int)fd->base_hue + (dh * 256);
+
+                    // 「炭火」下限 (消灯に見えない最低明度、基準の約 26%)
+                    int v_floor = (fd->base_val * 26) / 100;
+                    if (v_target < v_floor) v_target = v_floor;
+                    if (v_target > 255)     v_target = 255;
+
+                    // スパーク (低確率で短時間だけ上振れ)
+                    if ((flicker_rand(&fd->seed) & 0x3F) == 0) {
+                        v_target = (v_target * 3) / 2; // 1.5倍
+                        if (v_target > 255) v_target = 255;
+                    }
+
+                    // 目標値を保存
+                    fd->val_target = (uint8_t)v_target;
+                    fd->hue_target = (uint16_t)h_target;
+                }
+
+                // 非対称ローパスフィルタ (上昇はゆっくり、下降は速め)
+                float v_cur = (float)fd->val_ema;
+                float v_tgt = (float)fd->val_target;
+                float a_up = alpha_base * 0.7f;     // 上昇は遅く
+                float a_down = alpha_base * 1.2f;   // 下降は速く
+                float a_v = (v_tgt > v_cur) ? a_up : a_down;
+                float v_next = v_cur + a_v * (v_tgt - v_cur);
+                if (v_next < 0.0f) v_next = 0.0f;
+                if (v_next > 255.0f) v_next = 255.0f;
+                fd->val_ema = (uint8_t)v_next;
+
+                // 色相の平滑 (明度よりやや速い)
+                float h_cur = (float)fd->hue_ema;
+                float h_tgt = (float)fd->hue_target;
+                float a_h = alpha_base * 1.1f;
+                float h_next = h_cur + a_h * (h_tgt - h_cur);
+                if (h_next < 0.0f) h_next = 0.0f;
+                if (h_next > 65535.0f) h_next = 65535.0f;
+                fd->hue_ema = (uint16_t)h_next;
+
+                // 彩度は明るいほど少し下げて白飛びを抑える
+                uint8_t s_base = fd->base_sat;
+                uint8_t s_now = (uint8_t)(s_base - ((uint32_t)fd->val_ema * 12) / 255);
+
+                // HSV → RGB (全体輝度を反映) → ガンマ補正
+                uint8_t v_final = (uint8_t)(((uint32_t)fd->val_ema * config->brightness) / 255);
+                uint32_t rgb = ws2812b_color_hsv(fd->hue_ema, s_now, v_final);
+                rgb = gamma32(rgb);
+
+                // 出力 RGB を取り出す
+                r = (rgb >> 16) & 0xFF;
+                g = (rgb >>  8) & 0xFF;
+                b = rgb & 0xFF;
+
+                break;
+            }
+
             default:
                 // 未設定または不明なパターン
                 break;
@@ -554,9 +766,9 @@ static void update_ws2812b_patterns(void)
 
             if (update_this_led)
             {
-                // GRB 形式で LED データバッファに書き込み
-                config->led_data[led_idx * 3] = g;
-                config->led_data[led_idx * 3 + 1] = r;
+                // RGB 形式で LED データバッファに書き込み
+                config->led_data[led_idx * 3] = r;
+                config->led_data[led_idx * 3 + 1] = g;
                 config->led_data[led_idx * 3 + 2] = b;
                 need_update = true;
             }
@@ -1364,6 +1576,13 @@ static void stop_ws2812b_if_active(uint8_t pin)
             config->led_patterns = NULL;
         }
 
+        // flicker_data を解放
+        if (config->flicker_data != NULL)
+        {
+            free(config->flicker_data);
+            config->flicker_data = NULL;
+        }
+
         config->num_leds = 0;
         config->brightness = 0;
 
@@ -1478,6 +1697,9 @@ static esp_err_t gpio_enable_ws2812b(uint8_t pin, uint16_t num_leds, uint8_t bri
     // LED 個別パターンは NULL で初期化 (必要に応じて動的割り当て)
     ws2812b_configs[pin].led_patterns = NULL;
 
+    // flicker_data は NULL で初期化 (必要に応じて動的割り当て)
+    ws2812b_configs[pin].flicker_data = NULL;
+
     portENTER_CRITICAL(&gpio_states_mux);
     gpio_states[pin].mode = BLEIO_MODE_WS2812B;
     portEXIT_CRITICAL(&gpio_states_mux);
@@ -1545,10 +1767,10 @@ static esp_err_t gpio_set_ws2812b_color(uint8_t pin, uint16_t led_index, uint8_t
     uint32_t g_scaled = (g * config->brightness) / 255;
     uint32_t b_scaled = (b * config->brightness) / 255;
 
-    // GRB 形式で保存 (配列アクセスは 0-indexed なので -1)
+    // RGB 形式で保存 (配列アクセスは 0-indexed なので -1)
     uint32_t offset = (led_index - 1) * 3;
-    config->led_data[offset + 0] = (uint8_t)g_scaled;
-    config->led_data[offset + 1] = (uint8_t)r_scaled;
+    config->led_data[offset + 0] = (uint8_t)r_scaled;
+    config->led_data[offset + 1] = (uint8_t)g_scaled;
     config->led_data[offset + 2] = (uint8_t)b_scaled;
 
     // データを送信
@@ -1592,8 +1814,8 @@ static esp_err_t gpio_set_ws2812b_pattern(uint8_t pin, uint8_t led_index,
 
     ws2812b_config_t *config = &ws2812b_configs[pin];
 
-    // パターンタイプの検証 (0-3 および 0xFF (UNSET) を許可)
-    if (pattern_type > WS2812B_PATTERN_RAINBOW && pattern_type != WS2812B_PATTERN_UNSET)
+    // パターンタイプの検証 (0-4 および 0xFF (UNSET) を許可)
+    if (pattern_type > WS2812B_PATTERN_FLICKER && pattern_type != WS2812B_PATTERN_UNSET)
     {
         ESP_LOGE(TAG, "Invalid pattern type: %d", pattern_type);
         return ESP_ERR_INVALID_ARG;
