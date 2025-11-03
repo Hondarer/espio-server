@@ -49,6 +49,7 @@ static const ble_uuid128_t gatt_svr_chr_adc_read_uuid =
 #define CMD_SET_OUTPUT_ON_DISCONNECT 0x09
 #define CMD_SET_OUTPUT_WS2812B_ENABLE 0x11
 #define CMD_SET_OUTPUT_WS2812B_BASECOLOR 0x12
+#define CMD_SET_OUTPUT_WS2812B_PATTERN 0x13
 #define CMD_SET_INPUT_FLOATING 0x81
 #define CMD_SET_INPUT_PULLUP 0x82
 #define CMD_SET_INPUT_PULLDOWN 0x83
@@ -96,6 +97,13 @@ static const ble_uuid128_t gatt_svr_chr_adc_read_uuid =
 #define WS2812B_T1L_TICKS 5                    // 1 ビット LOW 時間 0.5us (5 × 0.1us)
 #define WS2812B_RESET_US 50                    // リセット信号時間 50us
 
+// WS2812B パターン定義
+#define WS2812B_PATTERN_ON 0            // 常時点灯 (デフォルト)
+#define WS2812B_PATTERN_BLINK_250MS 1   // 250ms 点灯 / 250ms 消灯
+#define WS2812B_PATTERN_BLINK_500MS 2   // 500ms 点灯 / 500ms 消灯
+#define WS2812B_PATTERN_RAINBOW 3       // 虹色パターン
+#define WS2812B_PATTERN_UNSET 0xFF      // 未設定 (個別 LED パターン用)
+
 // GPIO モード状態の定義
 typedef enum
 {
@@ -136,6 +144,15 @@ typedef struct
     adc_cali_handle_t cali_handle; // キャリブレーションハンドル
 } adc_config_t;
 
+// WS2812B LED 個別パターン設定構造体
+typedef struct
+{
+    uint8_t pattern_type;   // パターンタイプ (0-3, 0xFF=未設定)
+    uint8_t pattern_param1; // パラメータ1 (RAINBOW: 色相が一周する LED 個数)
+    uint8_t pattern_param2; // パラメータ2 (RAINBOW: 変化スピード)
+    uint16_t hue;           // RAINBOW 用の現在色相 (0-65535)
+} ws2812b_led_pattern_t;
+
 // WS2812B 設定保持用構造体
 typedef struct
 {
@@ -144,6 +161,11 @@ typedef struct
     uint8_t *led_data;                  // LED データバッファ (GRB 形式、3 バイト × LED 個数)
     rmt_channel_handle_t rmt_channel;   // RMT チャネルハンドル
     rmt_encoder_handle_t rmt_encoder;   // RMT エンコーダハンドル
+
+    // パターン関連
+    ws2812b_led_pattern_t gpio_pattern; // GPIO 全体のデフォルトパターン (LED 番号 0)
+    ws2812b_led_pattern_t *led_patterns; // LED 個別のパターン配列 (num_leds 個、動的割り当て)
+    uint8_t *base_colors;               // LED ごとのベースカラー (RGB 形式、3 バイト × num_leds)
 } ws2812b_config_t;
 
 // GPIO ごとの状態管理
@@ -194,6 +216,26 @@ static const adc_atten_t adc_atten_map[] = {
 };
 #define ADC_ATTEN_MAP_SIZE (sizeof(adc_atten_map) / sizeof(adc_atten_map[0]))
 
+// ガンマ補正テーブル (ガンマ値 2.6)
+static const uint8_t gamma8[256] = {
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   1,   1,   1,
+    1,   1,   1,   1,   1,   1,   1,   1,   1,   2,   2,   2,   2,   2,   2,   2,
+    2,   3,   3,   3,   3,   3,   3,   3,   4,   4,   4,   4,   4,   5,   5,   5,
+    5,   6,   6,   6,   6,   7,   7,   7,   7,   8,   8,   8,   9,   9,   9,  10,
+   10,  10,  11,  11,  11,  12,  12,  13,  13,  13,  14,  14,  15,  15,  16,  16,
+   17,  17,  18,  18,  19,  19,  20,  20,  21,  21,  22,  22,  23,  24,  24,  25,
+   25,  26,  27,  27,  28,  29,  29,  30,  31,  32,  32,  33,  34,  35,  35,  36,
+   37,  38,  39,  39,  40,  41,  42,  43,  44,  45,  46,  47,  48,  49,  50,  50,
+   51,  52,  54,  55,  56,  57,  58,  59,  60,  61,  62,  63,  64,  66,  67,  68,
+   69,  70,  72,  73,  74,  75,  77,  78,  79,  81,  82,  83,  85,  86,  87,  89,
+   90,  92,  93,  95,  96,  98,  99, 101, 102, 104, 105, 107, 109, 110, 112, 114,
+  115, 117, 119, 120, 122, 124, 126, 127, 129, 131, 133, 135, 137, 138, 140, 142,
+  144, 146, 148, 150, 152, 154, 156, 158, 160, 162, 164, 167, 169, 171, 173, 175,
+  177, 180, 182, 184, 186, 189, 191, 193, 196, 198, 200, 203, 205, 208, 210, 213,
+  215, 218, 220, 223, 225, 228, 231, 233, 236, 239, 241, 244, 247, 249, 252, 255
+};
+
 // グローバル変数
 static uint16_t conn_handle = 0;
 static bleio_gpio_state_t gpio_states[40] = {0};                  // 全 GPIO の状態
@@ -203,6 +245,7 @@ static adc_config_t adc_configs[40] = {0};                        // 全 GPIO �
 static adc_oneshot_unit_handle_t adc1_handle = NULL;              // ADC1 ユニットハンドル
 static ws2812b_config_t ws2812b_configs[40] = {0};                  // 全 GPIO の WS2812B 設定
 static uint8_t global_blink_counter = 0;                          // 全 GPIO 共通の点滅カウンタ
+static uint8_t prev_blink_counter = 0xFF;                         // 前回の点滅カウンタ (変化検出用)
 static esp_timer_handle_t blink_timer = NULL;
 static esp_timer_handle_t input_poll_timer = NULL;
 static portMUX_TYPE gpio_states_mux = portMUX_INITIALIZER_UNLOCKED; // gpio_states 保護用スピンロック
@@ -263,6 +306,307 @@ static void blink_timer_callback(void *arg)
             portEXIT_CRITICAL(&gpio_states_mux);
 
             gpio_set_level(pin, new_level);
+        }
+    }
+}
+
+// WS2812B ヘルパー関数 (update_ws2812b_patterns の前に定義)
+
+/**
+ * @brief ガンマ補正を適用 (32bit RGB 値)
+ *
+ * @param rgb RGB 値 (R << 16) | (G << 8) | B
+ * @return uint32_t ガンマ補正後の RGB 値
+ */
+static inline uint32_t gamma32(uint32_t rgb)
+{
+    uint8_t r = (rgb >> 16) & 0xFF;
+    uint8_t g = (rgb >> 8) & 0xFF;
+    uint8_t b = rgb & 0xFF;
+
+    r = gamma8[r];
+    g = gamma8[g];
+    b = gamma8[b];
+
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+/**
+ * @brief HSV 色空間から RGB 色空間への変換
+ *
+ * @param hue 色相 (0-65535)
+ * @param sat 彩度 (0-255)
+ * @param val 明度 (0-255)
+ * @return uint32_t RGB 値 (R << 16) | (G << 8) | B
+ */
+static uint32_t ws2812b_color_hsv(uint16_t hue, uint8_t sat, uint8_t val)
+{
+    // セクタント計算 (色相環を 6 分割)
+    // hue * 6 を計算して、上位ビットからセクタント番号と位置を取得
+    uint32_t hue_scaled = (uint32_t)hue * 6;
+    uint8_t sextant = hue_scaled >> 16;      // 整数部分 (0-6)
+    uint8_t h_fraction = (hue_scaled >> 8) & 0xFF;  // 小数部分の上位 8 ビット (0-255)
+
+    if (sextant > 5)
+    {
+        sextant = 5;
+        h_fraction = 255;  // 端数処理: 最大値にクリップ
+    }
+
+    // 彩度 0 の場合はグレースケール
+    if (sat == 0)
+    {
+        return (val << 16) | (val << 8) | val;
+    }
+
+    // 中間値計算: bottom (最小輝度)
+    uint16_t invsat = 255 - sat;
+    uint16_t ww = val * invsat;
+    ww += 1;
+    ww += ww >> 8;
+    uint8_t bottom = ww >> 8;
+
+    uint8_t top = val;
+
+    // スケール値計算
+    ww = val * sat;
+    ww += 1;
+    ww += ww >> 8;
+    uint8_t scale_val = ww >> 8;
+
+    // rising (上昇する中間値)
+    ww = scale_val * h_fraction;
+    ww += 1;
+    ww += ww >> 8;
+    uint8_t rising = (ww >> 8) + bottom;
+
+    // falling (下降する中間値)
+    uint8_t inv_h_fraction = 255 - h_fraction;
+    ww = scale_val * inv_h_fraction;
+    ww += 1;
+    ww += ww >> 8;
+    uint8_t falling = (ww >> 8) + bottom;
+
+    // セクタントに応じて RGB を割り当て
+    uint8_t r, g, b;
+    switch (sextant)
+    {
+    case 0:
+        r = top;
+        g = rising;
+        b = bottom;
+        break; // 赤 → 黄
+    case 1:
+        r = falling;
+        g = top;
+        b = bottom;
+        break; // 黄 → 緑
+    case 2:
+        r = bottom;
+        g = top;
+        b = rising;
+        break; // 緑 → シアン
+    case 3:
+        r = bottom;
+        g = falling;
+        b = top;
+        break; // シアン → 青
+    case 4:
+        r = rising;
+        g = bottom;
+        b = top;
+        break; // 青 → マゼンタ
+    default:
+        r = top;
+        g = bottom;
+        b = falling;
+        break; // マゼンタ → 赤
+    }
+
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+// WS2812B LED パターン更新処理 (10ms 周期で呼び出し)
+static void update_ws2812b_patterns(void)
+{
+    // BLINK 系パターンの更新が必要か判定 (global_blink_counter が変化したとき)
+    bool blink_changed = (global_blink_counter != prev_blink_counter);
+    if (blink_changed)
+    {
+        prev_blink_counter = global_blink_counter;
+    }
+
+    // デジタル出力の点滅状態を取得
+    bool blink_250ms_level = (global_blink_counter % 2 == 0);
+    bool blink_500ms_level = (global_blink_counter < 2);
+
+    for (int pin = 0; pin < 40; pin++)
+    {
+        if (!is_valid_gpio(pin))
+            continue;
+
+        portENTER_CRITICAL(&gpio_states_mux);
+        bleio_gpio_state_t *state = &gpio_states[pin];
+        bleio_mode_state_t mode = state->mode;
+        portEXIT_CRITICAL(&gpio_states_mux);
+
+        if (mode != BLEIO_MODE_WS2812B)
+            continue;
+
+        ws2812b_config_t *config = &ws2812b_configs[pin];
+        if (config->num_leds == 0 || config->led_data == NULL)
+            continue;
+
+        bool need_update = false;
+        bool has_rainbow = false;
+
+        // LED ごとにパターンを適用
+        for (uint16_t led_idx = 0; led_idx < config->num_leds; led_idx++)
+        {
+            // パターン設定を取得 (個別設定がなければ GPIO パターン)
+            ws2812b_led_pattern_t *pattern = &config->gpio_pattern;
+            if (config->led_patterns != NULL &&
+                config->led_patterns[led_idx].pattern_type != WS2812B_PATTERN_UNSET)
+            {
+                pattern = &config->led_patterns[led_idx];
+            }
+
+            uint8_t r = 0, g = 0, b = 0;
+            bool update_this_led = false;
+
+            switch (pattern->pattern_type)
+            {
+            case WS2812B_PATTERN_ON:
+                // ベースカラーに基準輝度を適用 (初回のみ更新)
+                if (config->base_colors != NULL)
+                {
+                    r = (config->base_colors[led_idx * 3] * config->brightness) / 255;
+                    g = (config->base_colors[led_idx * 3 + 1] * config->brightness) / 255;
+                    b = (config->base_colors[led_idx * 3 + 2] * config->brightness) / 255;
+                }
+                // PATTERN_ON は変化しないので、初回設定以降は更新不要
+                break;
+
+            case WS2812B_PATTERN_BLINK_250MS:
+                // BLINK 系は global_blink_counter が変化したときのみ更新
+                if (blink_changed)
+                {
+                    if (blink_250ms_level && config->base_colors != NULL)
+                    {
+                        r = (config->base_colors[led_idx * 3] * config->brightness) / 255;
+                        g = (config->base_colors[led_idx * 3 + 1] * config->brightness) / 255;
+                        b = (config->base_colors[led_idx * 3 + 2] * config->brightness) / 255;
+                    }
+                    update_this_led = true;
+                }
+                break;
+
+            case WS2812B_PATTERN_BLINK_500MS:
+                // BLINK 系は global_blink_counter が変化したときのみ更新
+                if (blink_changed)
+                {
+                    if (blink_500ms_level && config->base_colors != NULL)
+                    {
+                        r = (config->base_colors[led_idx * 3] * config->brightness) / 255;
+                        g = (config->base_colors[led_idx * 3 + 1] * config->brightness) / 255;
+                        b = (config->base_colors[led_idx * 3 + 2] * config->brightness) / 255;
+                    }
+                    update_this_led = true;
+                }
+                break;
+
+            case WS2812B_PATTERN_RAINBOW:
+            {
+                // RAINBOW パターンは毎回更新
+                has_rainbow = true;
+                update_this_led = true;
+
+                // 色相が一周する LED 個数 (1-16)
+                uint8_t hue_period = pattern->pattern_param1;
+                if (hue_period == 0)
+                    hue_period = 12; // デフォルト
+
+                // 基準クロックは常に GPIO 全体の hue を使用 (すべての LED が同じクロックを共有)
+                uint16_t base_hue = config->gpio_pattern.hue;
+
+                // 色相オフセットの計算 (LED 番号によるオフセット)
+                // LED0 (ESP32 に近い) が最も進んだ色相、LED9 (遠い) が遅れた色相
+                // これにより、色が ESP32 から遠い方に流れるように見える
+                uint16_t hue_offset = ((uint32_t)led_idx * 65536) / hue_period;
+                uint16_t current_hue = base_hue - hue_offset;
+
+                // HSV → RGB 変換 (彩度 255、明度は基準輝度)
+                uint32_t rgb = ws2812b_color_hsv(current_hue, 255, config->brightness);
+
+                // ガンマ補正
+                rgb = gamma32(rgb);
+
+                r = (rgb >> 16) & 0xFF;
+                g = (rgb >> 8) & 0xFF;
+                b = rgb & 0xFF;
+                break;
+            }
+
+            default:
+                // 未設定または不明なパターン
+                break;
+            }
+
+            if (update_this_led)
+            {
+                // GRB 形式で LED データバッファに書き込み
+                config->led_data[led_idx * 3] = g;
+                config->led_data[led_idx * 3 + 1] = r;
+                config->led_data[led_idx * 3 + 2] = b;
+                need_update = true;
+            }
+        }
+
+        // 色相の更新 (RAINBOW パターン用)
+        // すべての RAINBOW LED は同じ基準クロック (gpio_pattern.hue) を共有
+        if (has_rainbow)
+        {
+            uint16_t speed = 128; // デフォルトスピード
+
+            // スピードの決定: GPIO パターンが RAINBOW なら、そのスピードを使用
+            if (config->gpio_pattern.pattern_type == WS2812B_PATTERN_RAINBOW)
+            {
+                speed = config->gpio_pattern.pattern_param2;
+                if (speed == 0)
+                    speed = 128;
+            }
+            else
+            {
+                // GPIO パターンが RAINBOW でない場合、最初の RAINBOW LED のスピードを使用
+                if (config->led_patterns != NULL)
+                {
+                    for (uint16_t led_idx = 0; led_idx < config->num_leds; led_idx++)
+                    {
+                        if (config->led_patterns[led_idx].pattern_type == WS2812B_PATTERN_RAINBOW)
+                        {
+                            speed = config->led_patterns[led_idx].pattern_param2;
+                            if (speed == 0)
+                                speed = 128;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 基準クロック (gpio_pattern.hue) を更新
+            uint16_t hue_increment = speed * 8; // チューニング係数
+            config->gpio_pattern.hue += hue_increment;
+        }
+
+        // RMT で LED に送信
+        if (need_update)
+        {
+            rmt_transmit_config_t tx_config = {
+                .loop_count = 0,
+            };
+
+            rmt_transmit(config->rmt_channel, config->rmt_encoder,
+                         config->led_data, config->num_leds * 3, &tx_config);
         }
     }
 }
@@ -333,6 +677,9 @@ static void input_poll_timer_callback(void *arg)
         state->last_level = level;
         portEXIT_CRITICAL(&gpio_states_mux);
     }
+
+    // WS2812B LED パターン更新処理
+    update_ws2812b_patterns();
 }
 
 // 認証機能とペアリングモードの判定
@@ -992,6 +1339,10 @@ static void stop_ws2812b_if_active(uint8_t pin)
             config->rmt_encoder = NULL;
         }
 
+        // RMT が GPIO の制御を解放した後、GPIO を LOW に設定して WS2812B の点灯を確実に消す
+        gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+        gpio_set_level(pin, 0);
+
         // LED データバッファを解放
         if (config->led_data != NULL)
         {
@@ -999,8 +1350,28 @@ static void stop_ws2812b_if_active(uint8_t pin)
             config->led_data = NULL;
         }
 
+        // base_colors を解放
+        if (config->base_colors != NULL)
+        {
+            free(config->base_colors);
+            config->base_colors = NULL;
+        }
+
+        // LED 個別パターンを解放
+        if (config->led_patterns != NULL)
+        {
+            free(config->led_patterns);
+            config->led_patterns = NULL;
+        }
+
         config->num_leds = 0;
         config->brightness = 0;
+
+        // パターン設定をクリア
+        config->gpio_pattern.pattern_type = WS2812B_PATTERN_ON;
+        config->gpio_pattern.pattern_param1 = 0;
+        config->gpio_pattern.pattern_param2 = 0;
+        config->gpio_pattern.hue = 0;
 
         portENTER_CRITICAL(&gpio_states_mux);
         gpio_states[pin].mode = BLEIO_MODE_UNSET;
@@ -1078,12 +1449,34 @@ static esp_err_t gpio_enable_ws2812b(uint8_t pin, uint16_t num_leds, uint8_t bri
         return ret;
     }
 
+    // base_colors 配列を割り当て (RGB 形式、3 バイト × num_leds)
+    uint8_t *base_colors = (uint8_t *)calloc(num_leds * 3, sizeof(uint8_t));
+    if (base_colors == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate base_colors");
+        rmt_disable(rmt_channel);
+        rmt_del_encoder(rmt_encoder);
+        rmt_del_channel(rmt_channel);
+        free(led_data);
+        return ESP_ERR_NO_MEM;
+    }
+
     // 設定を保存
     ws2812b_configs[pin].num_leds = num_leds;
     ws2812b_configs[pin].brightness = brightness;
     ws2812b_configs[pin].led_data = led_data;
     ws2812b_configs[pin].rmt_channel = rmt_channel;
     ws2812b_configs[pin].rmt_encoder = rmt_encoder;
+    ws2812b_configs[pin].base_colors = base_colors;
+
+    // GPIO パターンの初期化 (デフォルトは PATTERN_ON)
+    ws2812b_configs[pin].gpio_pattern.pattern_type = WS2812B_PATTERN_ON;
+    ws2812b_configs[pin].gpio_pattern.pattern_param1 = 0;
+    ws2812b_configs[pin].gpio_pattern.pattern_param2 = 0;
+    ws2812b_configs[pin].gpio_pattern.hue = 0;
+
+    // LED 個別パターンは NULL で初期化 (必要に応じて動的割り当て)
+    ws2812b_configs[pin].led_patterns = NULL;
 
     portENTER_CRITICAL(&gpio_states_mux);
     gpio_states[pin].mode = BLEIO_MODE_WS2812B;
@@ -1138,6 +1531,15 @@ static esp_err_t gpio_set_ws2812b_color(uint8_t pin, uint16_t led_index, uint8_t
         return ESP_ERR_INVALID_ARG;
     }
 
+    // base_colors に保存 (パターンで使用するため)
+    if (config->base_colors != NULL)
+    {
+        uint32_t base_offset = (led_index - 1) * 3;
+        config->base_colors[base_offset + 0] = r;
+        config->base_colors[base_offset + 1] = g;
+        config->base_colors[base_offset + 2] = b;
+    }
+
     // 輝度を適用
     uint32_t r_scaled = (r * config->brightness) / 255;
     uint32_t g_scaled = (g * config->brightness) / 255;
@@ -1171,6 +1573,98 @@ static esp_err_t gpio_set_ws2812b_color(uint8_t pin, uint16_t led_index, uint8_t
 
     ESP_LOGI(TAG, "Set LED%d on GPIO%d (R=%d, G=%d, B=%d → R=%d, G=%d, B=%d)",
              led_index, pin, r, g, b, (uint8_t)r_scaled, (uint8_t)g_scaled, (uint8_t)b_scaled);
+
+    return ESP_OK;
+}
+
+static esp_err_t gpio_set_ws2812b_pattern(uint8_t pin, uint8_t led_index,
+                                           uint8_t pattern_type, uint8_t param1, uint8_t param2)
+{
+    portENTER_CRITICAL(&gpio_states_mux);
+    bleio_mode_state_t mode = gpio_states[pin].mode;
+    portEXIT_CRITICAL(&gpio_states_mux);
+
+    if (mode != BLEIO_MODE_WS2812B)
+    {
+        ESP_LOGE(TAG, "GPIO%d is not in WS2812B mode", pin);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ws2812b_config_t *config = &ws2812b_configs[pin];
+
+    // パターンタイプの検証 (0-3 および 0xFF (UNSET) を許可)
+    if (pattern_type > WS2812B_PATTERN_RAINBOW && pattern_type != WS2812B_PATTERN_UNSET)
+    {
+        ESP_LOGE(TAG, "Invalid pattern type: %d", pattern_type);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // LED 番号 0 に対して UNSET は無効
+    if (led_index == 0 && pattern_type == WS2812B_PATTERN_UNSET)
+    {
+        ESP_LOGE(TAG, "Cannot set UNSET pattern to GPIO-wide pattern (led_index=0)");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (led_index == 0)
+    {
+        // GPIO 全体のパターン設定
+        config->gpio_pattern.pattern_type = pattern_type;
+        config->gpio_pattern.pattern_param1 = param1;
+        config->gpio_pattern.pattern_param2 = param2;
+        config->gpio_pattern.hue = 0; // 色相リセット
+
+        ESP_LOGI(TAG, "Set GPIO%d pattern to %d (all LEDs, param1=%d, param2=%d)",
+                 pin, pattern_type, param1, param2);
+    }
+    else
+    {
+        // 個別 LED のパターン設定
+        if (led_index > config->num_leds)
+        {
+            ESP_LOGE(TAG, "LED index %d out of range (max: %d)", led_index, config->num_leds);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        // LED パターン配列が未割り当てなら割り当て
+        if (config->led_patterns == NULL)
+        {
+            config->led_patterns = (ws2812b_led_pattern_t *)malloc(
+                config->num_leds * sizeof(ws2812b_led_pattern_t));
+            if (config->led_patterns == NULL)
+            {
+                ESP_LOGE(TAG, "Failed to allocate led_patterns");
+                return ESP_ERR_NO_MEM;
+            }
+
+            // すべて未設定 (0xFF) で初期化
+            for (uint16_t i = 0; i < config->num_leds; i++)
+            {
+                config->led_patterns[i].pattern_type = WS2812B_PATTERN_UNSET;
+                config->led_patterns[i].pattern_param1 = 0;
+                config->led_patterns[i].pattern_param2 = 0;
+                config->led_patterns[i].hue = 0;
+            }
+        }
+
+        // LED パターン設定
+        uint16_t idx = led_index - 1; // LED 番号 1 = インデックス 0
+        config->led_patterns[idx].pattern_type = pattern_type;
+        config->led_patterns[idx].pattern_param1 = param1;
+        config->led_patterns[idx].pattern_param2 = param2;
+        config->led_patterns[idx].hue = 0;
+
+        if (pattern_type == WS2812B_PATTERN_UNSET)
+        {
+            ESP_LOGI(TAG, "Cleared GPIO%d LED%d individual pattern (will use GPIO pattern)",
+                     pin, led_index);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Set GPIO%d LED%d pattern to %d (param1=%d, param2=%d)",
+                     pin, led_index, pattern_type, param1, param2);
+        }
+    }
 
     return ESP_OK;
 }
@@ -1459,6 +1953,14 @@ static int gatt_svr_chr_write_cb(uint16_t conn_handle, uint16_t attr_handle,
             uint8_t g = param3;
             uint8_t b = param4;
             ret = gpio_set_ws2812b_color(pin, led_index, r, g, b); // param1 = led_index, param2-4 = RGB
+        }
+        else if (command == CMD_SET_OUTPUT_WS2812B_PATTERN)
+        {
+            uint8_t led_index = param1;
+            uint8_t pattern_type = param2;
+            uint8_t pattern_param1 = param3;
+            uint8_t pattern_param2 = param4;
+            ret = gpio_set_ws2812b_pattern(pin, led_index, pattern_type, pattern_param1, pattern_param2);
         }
         else if (command >= CMD_SET_INPUT_FLOATING && command <= CMD_SET_INPUT_PULLDOWN)
         {
