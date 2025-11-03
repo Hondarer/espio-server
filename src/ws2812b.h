@@ -1,0 +1,81 @@
+#ifndef WS2812B_H
+#define WS2812B_H
+
+#include <stdint.h>
+#include "esp_err.h"
+#include "driver/rmt_tx.h"
+
+// WS2812B 設定
+#define WS2812B_MAX_LEDS 256                   // 1つの GPIO あたり最大 LED 数
+#define WS2812B_RMT_RESOLUTION_HZ 10000000     // RMT 解像度 10MHz (0.1us 刻み)
+#define WS2812B_T0H_TICKS 4                    // 0 ビット HIGH 時間 0.4us (4 × 0.1us)
+#define WS2812B_T0L_TICKS 9                    // 0 ビット LOW 時間 0.9us (9 × 0.1us)
+#define WS2812B_T1H_TICKS 8                    // 1 ビット HIGH 時間 0.8us (8 × 0.1us)
+#define WS2812B_T1L_TICKS 5                    // 1 ビット LOW 時間 0.5us (5 × 0.1us)
+#define WS2812B_RESET_US 50                    // リセット信号時間 50us
+
+// WS2812B パターン定義
+#define WS2812B_PATTERN_ON 0            // 常時点灯 (デフォルト)
+#define WS2812B_PATTERN_BLINK_250MS 1   // 250ms 点灯 / 250ms 消灯
+#define WS2812B_PATTERN_BLINK_500MS 2   // 500ms 点灯 / 500ms 消灯
+#define WS2812B_PATTERN_RAINBOW 3       // 虹色パターン
+#define WS2812B_PATTERN_FLICKER 4       // 炎のゆらめきパターン
+#define WS2812B_PATTERN_UNSET 0xFF      // 未設定 (個別 LED パターン用)
+
+// WS2812B LED 個別パターン設定構造体
+typedef struct
+{
+    uint8_t pattern_type;   // パターンタイプ (0-4, 0xFF=未設定)
+    uint8_t pattern_param1; // パラメータ1 (RAINBOW: 色相が一周する LED 個数、FLICKER: ゆらめきの速度)
+    uint8_t pattern_param2; // パラメータ2 (RAINBOW: 変化スピード、FLICKER: ゆらめきの変化幅)
+    uint16_t hue;           // RAINBOW 用の現在色相 (0-65535)
+} ws2812b_led_pattern_t;
+
+// WS2812B FLICKER パターン用のデータ構造
+typedef struct
+{
+    uint16_t base_hue;      // 基準色の色相 (キャッシュ)
+    uint8_t base_sat;       // 基準色の彩度 (キャッシュ)
+    uint8_t base_val;       // 基準色の明度 (キャッシュ)
+    uint32_t seed;          // 疑似乱数の状態
+    uint8_t val_ema;        // 明度の平滑値 (現在値) 0-255
+    uint16_t hue_ema;       // 色相の平滑値 (現在値) 0-65535
+    uint8_t val_target;     // 明度の目標値 0-255
+    uint16_t hue_target;    // 色相の目標値 0-65535
+    uint8_t tick;           // ローカルの間引きカウンタ
+} led_flicker_data_t;
+
+// WS2812B 設定保持用構造体
+typedef struct
+{
+    uint16_t num_leds;                  // LED 個数
+    uint8_t brightness;                 // 基準輝度 (0-255)
+    uint8_t *led_data;                  // LED データバッファ (RGB 形式、3 バイト × LED 個数)
+    rmt_channel_handle_t rmt_channel;   // RMT チャネルハンドル
+    rmt_encoder_handle_t rmt_encoder;   // RMT エンコーダハンドル
+
+    // パターン関連
+    ws2812b_led_pattern_t gpio_pattern; // GPIO 全体のデフォルトパターン (LED 番号 0)
+    ws2812b_led_pattern_t *led_patterns; // LED 個別のパターン配列 (num_leds 個、動的割り当て)
+    uint8_t *base_colors;               // LED ごとのベースカラー (RGB 形式、3 バイト × num_leds)
+    led_flicker_data_t *flicker_data;   // FLICKER パターン用のデータ (num_leds 個、動的割り当て)
+} ws2812b_config_t;
+
+// WS2812B 制御
+esp_err_t ws2812b_enable(uint8_t pin, uint16_t num_leds, uint8_t brightness);
+esp_err_t ws2812b_set_color(uint8_t pin, uint16_t led_index, uint8_t r, uint8_t g, uint8_t b);
+esp_err_t ws2812b_set_pattern(uint8_t pin, uint8_t led_index, uint8_t pattern_type,
+                               uint8_t param1, uint8_t param2);
+esp_err_t ws2812b_turn_off_all_leds(uint8_t pin);
+void ws2812b_stop(uint8_t pin);
+
+// 初期化
+void ws2812b_init(void);
+
+// パターン更新 (タイマーから呼び出される)
+void ws2812b_update_patterns(uint8_t blink_counter);
+
+// 状態アクセサ
+ws2812b_config_t* ws2812b_get_config(uint8_t pin);
+
+#endif // WS2812B_H
