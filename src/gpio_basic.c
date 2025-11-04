@@ -1,7 +1,7 @@
 #include "gpio_basic.h"
 #include "gpio_pwm.h"
 #include "gpio_adc.h"
-#include "ws2812b.h"
+#include "ws28xx.h"
 #include "main.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
@@ -243,9 +243,9 @@ void gpio_basic_update_blink_outputs(uint8_t global_blink_counter)
 
         bleio_gpio_state_t *state = main_get_gpio_state(pin);
 
-        portENTER_CRITICAL(mutex);
+        portENTER_CRITICAL_ISR(mutex);
         bleio_mode_state_t mode = state->mode;
-        portEXIT_CRITICAL(mutex);
+        portEXIT_CRITICAL_ISR(mutex);
 
         uint8_t new_level = 0;
         bool should_update = false;
@@ -265,9 +265,9 @@ void gpio_basic_update_blink_outputs(uint8_t global_blink_counter)
 
         if (should_update)
         {
-            portENTER_CRITICAL(mutex);
+            portENTER_CRITICAL_ISR(mutex);
             state->current_level = new_level;
-            portEXIT_CRITICAL(mutex);
+            portEXIT_CRITICAL_ISR(mutex);
 
             gpio_set_level(pin, new_level);
         }
@@ -287,13 +287,13 @@ void gpio_basic_update_input_latches(void)
 
         bleio_gpio_state_t *state = main_get_gpio_state(pin);
 
-        portENTER_CRITICAL(mutex);
+        portENTER_CRITICAL_ISR(mutex);
         uint8_t latch_mode = state->latch_mode;
         bool is_latched = state->is_latched;
         bleio_mode_state_t mode = state->mode;
         uint8_t last_level = state->last_level;
         uint8_t stable_counter = state->stable_counter;
-        portEXIT_CRITICAL(mutex);
+        portEXIT_CRITICAL_ISR(mutex);
 
         // ラッチモードが設定されていない、または既にラッチ済みの場合はスキップ
         if (latch_mode == LATCH_MODE_NONE || is_latched)
@@ -336,10 +336,10 @@ void gpio_basic_update_input_latches(void)
             new_stable_counter = 0;
         }
 
-        portENTER_CRITICAL(mutex);
+        portENTER_CRITICAL_ISR(mutex);
         state->is_latched = new_is_latched;
         state->stable_counter = new_stable_counter;
         state->last_level = level;
-        portEXIT_CRITICAL(mutex);
+        portEXIT_CRITICAL_ISR(mutex);
     }
 }

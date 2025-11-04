@@ -2,7 +2,7 @@
 #include "gpio_basic.h"
 #include "gpio_pwm.h"
 #include "gpio_adc.h"
-#include "ws2812b.h"
+#include "ws28xx.h"
 #include "ble_service.h"
 #include "esp_log.h"
 #include "esp_timer.h"

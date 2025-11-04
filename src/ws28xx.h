@@ -1,5 +1,5 @@
-#ifndef WS2812B_H
-#define WS2812B_H
+#ifndef WS28XX_H
+#define WS28XX_H
 
 #include <stdint.h>
 #include "esp_err.h"
@@ -21,6 +21,13 @@
 #define WS2812B_PATTERN_RAINBOW 3       // 虹色パターン
 #define WS2812B_PATTERN_FLICKER 4       // 炎のゆらめきパターン
 #define WS2812B_PATTERN_UNSET 0xFF      // 未設定 (個別 LED パターン用)
+
+// シリアル LED 種別 (カラーオーダー)
+typedef enum {
+    LED_TYPE_WS2812B_RGB = 0,   // WS2812B バリアント (RGB 順、デフォルト)
+    LED_TYPE_WS2812B_GRB = 1,   // WS2812B 標準仕様 (GRB 順)
+    LED_TYPE_WS2811 = 2         // WS2811 (RGB 順)
+} serial_led_type_t;
 
 // WS2812B LED 個別パターン設定構造体
 typedef struct
@@ -50,6 +57,7 @@ typedef struct
 {
     uint16_t num_leds;                  // LED 個数
     uint8_t brightness;                 // 基準輝度 (0-255)
+    serial_led_type_t led_type;         // LED 種別 (カラーオーダー)
     uint8_t *led_data;                  // LED データバッファ (RGB 形式、3 バイト × LED 個数)
     rmt_channel_handle_t rmt_channel;   // RMT チャネルハンドル
     rmt_encoder_handle_t rmt_encoder;   // RMT エンコーダハンドル
@@ -62,7 +70,7 @@ typedef struct
 } ws2812b_config_t;
 
 // WS2812B 制御
-esp_err_t ws2812b_enable(uint8_t pin, uint16_t num_leds, uint8_t brightness);
+esp_err_t ws2812b_enable(uint8_t pin, uint16_t num_leds, uint8_t brightness, serial_led_type_t led_type);
 esp_err_t ws2812b_set_color(uint8_t pin, uint16_t led_index, uint8_t r, uint8_t g, uint8_t b);
 esp_err_t ws2812b_set_pattern(uint8_t pin, uint8_t led_index, uint8_t pattern_type,
                                uint8_t param1, uint8_t param2);
@@ -78,4 +86,4 @@ void ws2812b_update_patterns(uint8_t blink_counter);
 // 状態アクセサ
 ws2812b_config_t* ws2812b_get_config(uint8_t pin);
 
-#endif // WS2812B_H
+#endif // WS28XX_H

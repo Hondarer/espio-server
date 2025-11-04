@@ -1,4 +1,4 @@
-#include "ws2812b.h"
+#include "ws28xx.h"
 #include "main.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -362,9 +362,9 @@ void ws2812b_update_patterns(uint8_t blink_counter)
         portMUX_TYPE *mutex = main_get_gpio_states_mutex();
         bleio_gpio_state_t *state = main_get_gpio_state(pin);
 
-        portENTER_CRITICAL(mutex);
+        portENTER_CRITICAL_ISR(mutex);
         bleio_mode_state_t mode = state->mode;
-        portEXIT_CRITICAL(mutex);
+        portEXIT_CRITICAL_ISR(mutex);
 
         if (mode != BLEIO_MODE_WS2812B)
             continue;
@@ -523,8 +523,8 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                 uint8_t range = pattern->pattern_param2;   // 1..255 (0 のときはデフォルト)
                 if (range == 0) range = 128;
 
-                // 速度からローパス係数を作る (0.06 .. 0.18 程度)
-                float alpha_base = 0.06f + 0.12f * ((float)speed / 255.0f);
+                // 速度からローパス係数を作る (0.08 .. 0.22 程度)
+                float alpha_base = 0.08f + 0.14f * ((float)speed / 255.0f);
 
                 // 目標値の更新は 40〜80[ms] 程度に間引く (tick で管理)
                 led_flicker_data_t *fd = &config->flicker_data[led_idx];
@@ -599,10 +599,31 @@ void ws2812b_update_patterns(uint8_t blink_counter)
 
             if (update_this_led)
             {
-                // RGB 形式で LED データバッファに書き込み
-                config->led_data[led_idx * 3] = r;
-                config->led_data[led_idx * 3 + 1] = g;
-                config->led_data[led_idx * 3 + 2] = b;
+                // カラーオーダーに応じて LED データバッファに書き込み
+                switch (config->led_type)
+                {
+                case LED_TYPE_WS2812B_RGB:
+                case LED_TYPE_WS2811:
+                    // RGB 順
+                    config->led_data[led_idx * 3] = r;
+                    config->led_data[led_idx * 3 + 1] = g;
+                    config->led_data[led_idx * 3 + 2] = b;
+                    break;
+
+                case LED_TYPE_WS2812B_GRB:
+                    // GRB 順
+                    config->led_data[led_idx * 3] = g;
+                    config->led_data[led_idx * 3 + 1] = r;
+                    config->led_data[led_idx * 3 + 2] = b;
+                    break;
+
+                default:
+                    // デフォルトは RGB 順
+                    config->led_data[led_idx * 3] = r;
+                    config->led_data[led_idx * 3 + 1] = g;
+                    config->led_data[led_idx * 3 + 2] = b;
+                    break;
+                }
                 need_update = true;
             }
         }
@@ -807,7 +828,7 @@ void ws2812b_stop(uint8_t pin)
     }
 }
 
-esp_err_t ws2812b_enable(uint8_t pin, uint16_t num_leds, uint8_t brightness)
+esp_err_t ws2812b_enable(uint8_t pin, uint16_t num_leds, uint8_t brightness, serial_led_type_t led_type)
 {
     // パラメータ検証
     if (!main_is_valid_output_pin(pin))
@@ -820,6 +841,13 @@ esp_err_t ws2812b_enable(uint8_t pin, uint16_t num_leds, uint8_t brightness)
     {
         ESP_LOGE(TAG, "Invalid LED count: %d (range: 1-%d)", num_leds, WS2812B_MAX_LEDS);
         return ESP_ERR_INVALID_ARG;
+    }
+
+    // LED 種別の検証
+    if (led_type > LED_TYPE_WS2811)
+    {
+        ESP_LOGW(TAG, "Invalid LED type: %d, using default (WS2812B_RGB)", led_type);
+        led_type = LED_TYPE_WS2812B_RGB;
     }
 
     // 既存のモードをクリーンアップ
@@ -888,6 +916,7 @@ esp_err_t ws2812b_enable(uint8_t pin, uint16_t num_leds, uint8_t brightness)
     // 設定を保存
     ws2812b_configs[pin].num_leds = num_leds;
     ws2812b_configs[pin].brightness = brightness;
+    ws2812b_configs[pin].led_type = led_type;
     ws2812b_configs[pin].led_data = led_data;
     ws2812b_configs[pin].rmt_channel = rmt_channel;
     ws2812b_configs[pin].rmt_encoder = rmt_encoder;
@@ -978,11 +1007,32 @@ esp_err_t ws2812b_set_color(uint8_t pin, uint16_t led_index, uint8_t r, uint8_t 
     uint32_t g_scaled = (g * config->brightness) / 255;
     uint32_t b_scaled = (b * config->brightness) / 255;
 
-    // RGB 形式で保存 (配列アクセスは 0-indexed なので -1)
+    // カラーオーダーに応じて保存 (配列アクセスは 0-indexed なので -1)
     uint32_t offset = (led_index - 1) * 3;
-    config->led_data[offset + 0] = (uint8_t)r_scaled;
-    config->led_data[offset + 1] = (uint8_t)g_scaled;
-    config->led_data[offset + 2] = (uint8_t)b_scaled;
+    switch (config->led_type)
+    {
+    case LED_TYPE_WS2812B_RGB:
+    case LED_TYPE_WS2811:
+        // RGB 順
+        config->led_data[offset + 0] = (uint8_t)r_scaled;
+        config->led_data[offset + 1] = (uint8_t)g_scaled;
+        config->led_data[offset + 2] = (uint8_t)b_scaled;
+        break;
+
+    case LED_TYPE_WS2812B_GRB:
+        // GRB 順
+        config->led_data[offset + 0] = (uint8_t)g_scaled;
+        config->led_data[offset + 1] = (uint8_t)r_scaled;
+        config->led_data[offset + 2] = (uint8_t)b_scaled;
+        break;
+
+    default:
+        // デフォルトは RGB 順
+        config->led_data[offset + 0] = (uint8_t)r_scaled;
+        config->led_data[offset + 1] = (uint8_t)g_scaled;
+        config->led_data[offset + 2] = (uint8_t)b_scaled;
+        break;
+    }
 
     // データを送信
     rmt_transmit_config_t tx_config = {

@@ -2,7 +2,7 @@
 #include "gpio_basic.h"
 #include "gpio_pwm.h"
 #include "gpio_adc.h"
-#include "ws2812b.h"
+#include "ws28xx.h"
 #include "main.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -119,7 +119,8 @@ static int gatt_svr_chr_write_cb(uint16_t conn_handle, uint16_t attr_handle,
         {
             uint16_t num_leds = param1;
             uint8_t brightness = (param2 == 0) ? 255 : param2; // 0 の場合は 100% (255)
-            ret = ws2812b_enable(pin, num_leds, brightness); // param1 = num_leds, param2 = brightness
+            serial_led_type_t led_type = (serial_led_type_t)param3; // param3 = LED 種別 (デフォルト: 0)
+            ret = ws2812b_enable(pin, num_leds, brightness, led_type); // param1 = num_leds, param2 = brightness, param3 = led_type
         }
         else if (command == CMD_SET_OUTPUT_WS2812B_BASECOLOR)
         {
