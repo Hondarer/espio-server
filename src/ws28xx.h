@@ -22,6 +22,10 @@
 #define WS2812B_PATTERN_FLICKER 4       // 炎のゆらめきパターン
 #define WS2812B_PATTERN_UNSET 0xFF      // 未設定 (個別 LED パターン用)
 
+// FLICKER パターンの色相ゆらぎ係数
+// 0 で色相ゆらぎ無効、32 で range=128 時に約 ±2000 (色相環の約 ±3%) のゆらぎ
+#define WS2812B_FLICKER_HUE_VARIATION 8
+
 // シリアル LED 種別 (カラーオーダー)
 typedef enum {
     LED_TYPE_WS2812B_RGB = 0,   // WS2812B バリアント (RGB 順、デフォルト)
@@ -47,9 +51,11 @@ typedef struct
     uint32_t seed;          // 疑似乱数の状態
     uint8_t val_ema;        // 明度の平滑値 (現在値) 0-255
     uint16_t hue_ema;       // 色相の平滑値 (現在値) 0-65535
-    uint8_t val_target;     // 明度の目標値 0-255
-    uint16_t hue_target;    // 色相の目標値 0-65535
-    uint8_t tick;           // ローカルの間引きカウンタ
+    float x;                // 間欠カオス法の状態変数 (明度用) (0.0-1.0)
+    uint8_t count;          // 明度移行カウンタ
+    uint8_t maxloop;        // 明度移行目標値
+    float hue_offset;       // 色相オフセットの平滑値 (-1.0-1.0)
+    float hue_offset_target; // 色相オフセットの目標値 (-1.0-1.0)
 } led_flicker_data_t;
 
 // WS2812B 設定保持用構造体
