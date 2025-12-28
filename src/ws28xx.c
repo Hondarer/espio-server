@@ -440,7 +440,7 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                 // 色相が一周する LED 個数 (1-16)
                 uint8_t hue_period = pattern->pattern_param1;
                 if (hue_period == 0)
-                    hue_period = 12; // デフォルト
+                    hue_period = 12; // 0 の場合は、デフォルト値として 12 を設定する
 
                 // 基準クロックは常に GPIO 全体の hue を使用 (すべての LED が同じクロックを共有)
                 uint16_t base_hue = config->gpio_pattern.hue;
@@ -540,9 +540,7 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                 {
                     // FLICKER1 のパラメータを GPIO 共有パラメータに保存 (最後に処理された値を使用)
                     uint8_t speed = pattern->pattern_param1;
-                    if (speed == 0) speed = 128;
                     uint8_t range = pattern->pattern_param2;
-                    if (range == 0) range = 128;
                     config->flicker1_speed = speed;
                     config->flicker1_range = range;
 
@@ -592,19 +590,30 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                     // 各 LED の base_val に依存せず、正規化された値 (0-1) で計算する
                     float y_normalized = fd->y_prev;  // 前回の y_normalized を使用
 
+                    // EMA 計算 (平滑化係数を speed で調整)
                     float maxloop_f = (float)fd->maxloop;
-                    y_normalized = y_normalized * (1.0f - 1.0f / maxloop_f) + fd->x * (1.0f / maxloop_f);
+                    float alpha = 1.0f / maxloop_f;
 
-                    // range パラメータで変化幅を調整 (0-1 の範囲で) - GPIO 共有パラメータを使用
+                    // speed > 128 のときは平滑化係数を大きくして応答性を上げる
+                    if (config->flicker1_speed > 128) {
+                        // speed=255 で alpha を約 3 倍にする
+                        float speed_factor = 1.0f + (float)(config->flicker1_speed - 128) * 2.0f / 127.0f;
+                        alpha = alpha * speed_factor;
+                        if (alpha > 1.0f) alpha = 1.0f;
+                    }
+
+                    y_normalized = y_normalized * (1.0f - alpha) + fd->x * alpha;
+
+                    // EMA 計算後の y_normalized を保存 (range 調整前の値)
+                    fd->y_prev = y_normalized;
+
+                    // range パラメータで変化幅を調整 (0-1 の範囲で、出力用のみ) - GPIO 共有パラメータを使用
                     float range_factor = (float)config->flicker1_range / 128.0f;
                     y_normalized = 0.5f + (y_normalized - 0.5f) * range_factor;
 
                     // 0-1 にクリップ
                     if (y_normalized < 0.0f) y_normalized = 0.0f;
                     if (y_normalized > 1.0f) y_normalized = 1.0f;
-
-                    // range 調整後の y_normalized を保存 (FLICKER2 と同じ動作にする)
-                    fd->y_prev = y_normalized;
 
                     // PWM 範囲 62.5%-100% を base_val に適用
                     // 出力 = (y * 96/256 + 160/256) * base_val = (y * 0.375 + 0.625) * base_val
@@ -620,10 +629,17 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                         fd->count = 0;
 
                         // 移行スピードを乱数で調整 (speed パラメータで調整) - GPIO 共有パラメータを使用
-                        // speed が低いほど maxloop が大きくなり、変化が遅くなる
-                        uint8_t base_maxloop = 14 - (config->flicker1_speed / 32);  // 6..14 程度の範囲
-                        if (base_maxloop < 3) base_maxloop = 3;
-                        fd->maxloop = (flicker_rand(&fd->seed) % 9) + base_maxloop;
+                        // speed が大きいほど maxloop が小さくなり、変化が速くなる
+                        // 目標: speed=0 で約 1秒、speed=128 で約 0.1秒 (基準)、speed=255 で約 0.1秒、全体で約 10 倍
+                        uint8_t base_maxloop;
+                        if (config->flicker1_speed <= 128) {
+                            // speed 0-128: base_maxloop 100-10 (1秒→0.1秒、10倍の傾斜)
+                            base_maxloop = 10 + ((uint16_t)(128 - config->flicker1_speed) * 90 / 128);
+                        } else {
+                            // speed 129-255: base_maxloop 10-10 (0.1秒前後を維持)
+                            base_maxloop = 10;
+                        }
+                        fd->maxloop = (flicker_rand(&fd->seed) % 10) + base_maxloop;
                     }
 
                     // 色相ゆらぎなし (基準色をそのまま使用)
@@ -646,9 +662,7 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                 // FLICKER2/3: LED ごとの状態を使用
                 // パラメータ取得 (LED ごとに独立)
                 uint8_t speed = pattern->pattern_param1;
-                if (speed == 0) speed = 128;
                 uint8_t range = pattern->pattern_param2;
-                if (range == 0) range = 128;
 
                 // 基準色が変更される可能性があるので、RGB → HSV 変換を実行してキャッシュを更新
                 rgb_to_hsv(base_r, base_g, base_b,
@@ -705,15 +719,32 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                     }
                 }
 
-                // val_ema から y_normalized に逆変換
+                // val_ema から y_normalized に逆変換 (range 調整前の値)
                 // val_ema = (y_normalized * 0.375 + 0.625) * base_val
                 // → y_normalized = (val_ema / base_val - 0.625) / 0.375
                 float y_normalized = ((float)fd->val_ema / (float)fd->base_val - 0.625f) / 0.375f;
 
+                // EMA 計算 (平滑化係数を speed で調整)
                 float maxloop_f = (float)fd->maxloop;
-                y_normalized = y_normalized * (1.0f - 1.0f / maxloop_f) + fd->x * (1.0f / maxloop_f);
+                float alpha = 1.0f / maxloop_f;
 
-                // range パラメータで変化幅を調整 (0-1 の範囲で)
+                // speed > 128 のときは平滑化係数を大きくして応答性を上げる
+                if (speed > 128) {
+                    // speed=255 で alpha を約 3 倍にする
+                    float speed_factor = 1.0f + (float)(speed - 128) * 2.0f / 127.0f;
+                    alpha = alpha * speed_factor;
+                    if (alpha > 1.0f) alpha = 1.0f;
+                }
+
+                y_normalized = y_normalized * (1.0f - alpha) + fd->x * alpha;
+
+                // EMA 計算後の y_normalized を val_ema に保存 (range 調整前の値)
+                // PWM 範囲 62.5%-100% を base_val に適用
+                float val_out_before_range = (y_normalized * 0.375f + 0.625f) * (float)fd->base_val;
+                if (val_out_before_range > 255.0f) val_out_before_range = 255.0f;
+                fd->val_ema = (uint8_t)val_out_before_range;
+
+                // range パラメータで変化幅を調整 (0-1 の範囲で、出力用のみ)
                 float range_factor = (float)range / 128.0f;
                 y_normalized = 0.5f + (y_normalized - 0.5f) * range_factor;
 
@@ -722,12 +753,10 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                 if (y_normalized > 1.0f) y_normalized = 1.0f;
 
                 // PIC版と同じスケーリング: CCPR1L = y * 96.0 + 160.0
-                // PWM 範囲 62.5%-100% を base_val に適用
+                // PWM 範囲 62.5%-100% を base_val に適用 (出力)
                 // 出力 = (y * 96/256 + 160/256) * base_val = (y * 0.375 + 0.625) * base_val
                 float val_out = (y_normalized * 0.375f + 0.625f) * (float)fd->base_val;
                 if (val_out > 255.0f) val_out = 255.0f;
-
-                fd->val_ema = (uint8_t)val_out;
 
                 // カウンタを更新
                 fd->count++;
@@ -736,10 +765,17 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                     fd->count = 0;
 
                     // 移行スピードを乱数で調整 (speed パラメータで調整)
-                    // speed が低いほど maxloop が大きくなり、変化が遅くなる
-                    uint8_t base_maxloop = 14 - (speed / 32);  // 6..14 程度の範囲
-                    if (base_maxloop < 3) base_maxloop = 3;
-                    fd->maxloop = (flicker_rand(&fd->seed) % 9) + base_maxloop;
+                    // speed が大きいほど maxloop が小さくなり、変化が速くなる
+                    // 目標: speed=0 で約 1秒、speed=128 で約 0.1秒 (基準)、speed=255 で約 0.1秒、全体で約 10 倍
+                    uint8_t base_maxloop;
+                    if (speed <= 128) {
+                        // speed 0-128: base_maxloop 100-10 (1秒→0.1秒、10倍の傾斜)
+                        base_maxloop = 10 + ((uint16_t)(128 - speed) * 90 / 128);
+                    } else {
+                        // speed 129-255: base_maxloop 10-10 (0.1秒前後を維持)
+                        base_maxloop = 10;
+                    }
+                    fd->maxloop = (flicker_rand(&fd->seed) % 10) + base_maxloop;
                 }
 
                 // 色相のゆらぎ (FLICKER3 のみ)
@@ -771,7 +807,9 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                 uint8_t s_now = fd->base_sat;
 
                 // HSV → RGB (全体輝度を反映) → ガンマ補正
-                uint8_t v_final = (uint8_t)(((uint32_t)fd->val_ema * config->brightness) / 255);
+                // val_out (range 調整後の値) を使用
+                uint8_t final_val = (uint8_t)val_out;
+                uint8_t v_final = (uint8_t)(((uint32_t)final_val * config->brightness) / 255);
                 uint32_t rgb = ws2812b_color_hsv(fd->hue_ema, s_now, v_final);
                 rgb = gamma32(rgb);
 
@@ -829,8 +867,6 @@ void ws2812b_update_patterns(uint8_t blink_counter)
             if (config->gpio_pattern.pattern_type == WS2812B_PATTERN_RAINBOW)
             {
                 speed = config->gpio_pattern.pattern_param2;
-                if (speed == 0)
-                    speed = 128;
             }
             else
             {
@@ -842,8 +878,6 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                         if (config->led_patterns[led_idx].pattern_type == WS2812B_PATTERN_RAINBOW)
                         {
                             speed = config->led_patterns[led_idx].pattern_param2;
-                            if (speed == 0)
-                                speed = 128;
                             break;
                         }
                     }
