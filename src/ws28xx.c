@@ -463,7 +463,9 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                 break;
             }
 
-            case WS2812B_PATTERN_FLICKER:
+            case WS2812B_PATTERN_FLICKER1:
+            case WS2812B_PATTERN_FLICKER2:
+            case WS2812B_PATTERN_FLICKER3:
             {
                 // FLICKER パターンは毎回更新
                 update_this_led = true;
@@ -477,8 +479,10 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                     base_b = config->base_colors[led_idx * 3 + 2];
                 }
 
-                // flicker_data が未確保の場合は確保
-                if (config->flicker_data == NULL)
+                // FLICKER2/3: flicker_data が未確保の場合は確保 (LED ごとの状態)
+                if ((pattern->pattern_type == WS2812B_PATTERN_FLICKER2 ||
+                     pattern->pattern_type == WS2812B_PATTERN_FLICKER3) &&
+                    config->flicker_data == NULL)
                 {
                     config->flicker_data = (led_flicker_data_t *)calloc(config->num_leds, sizeof(led_flicker_data_t));
                     if (config->flicker_data == NULL)
@@ -502,19 +506,19 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                                    &config->flicker_data[i].base_sat,
                                    &config->flicker_data[i].base_val);
 
-                        // 間欠カオス法用の初期化（ランダム化して開始時からリズム感を出す）
-                        // x: 0.3-0.7 のランダムな値（参考\main.c では 0.5 だが、開始時の変化を出すため）
+                        // 間欠カオス法用の初期化 (ランダム化して開始時からリズム感を出す)
+                        // x: 0.3-0.7 のランダムな値
                         uint32_t seed = config->flicker_data[i].seed;
                         uint8_t rand_x = flicker_rand(&seed);
                         config->flicker_data[i].x = 0.3f + (float)rand_x / 255.0f * 0.4f;  // 0.3-0.7
 
-                        // maxloop: 参考\main.c と同じく 3-11 のランダムな値
+                        // maxloop: 3-11 のランダムな値
                         config->flicker_data[i].maxloop = (flicker_rand(&seed) % 9) + 3;
 
-                        // count: 0-maxloop のランダムな値（すぐに x 更新が起きるようにする）
+                        // count: 0-maxloop のランダムな値 (すぐに x 更新が起きるようにする)
                         config->flicker_data[i].count = flicker_rand(&seed) % (config->flicker_data[i].maxloop + 1);
 
-                        // 色相用の初期化（明度とは独立したランダム値）
+                        // 色相用の初期化 (明度とは独立したランダム値) - FLICKER3 のみで使用
                         uint8_t rand_hue = flicker_rand(&seed);
                         config->flicker_data[i].hue_offset_target = -0.5f + (float)rand_hue / 255.0f;  // -0.5 - +0.5
                         config->flicker_data[i].hue_offset = config->flicker_data[i].hue_offset_target;
@@ -523,7 +527,7 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                         config->flicker_data[i].seed = seed;
 
                         // フィールドの初期値
-                        // y の初期値は x に対応する値（ランダム化された x から計算）
+                        // y の初期値は x に対応する値 (ランダム化された x から計算)
                         // val_ema = (x * 0.375 + 0.625) * base_val
                         float y_init = (config->flicker_data[i].x * 0.375f + 0.625f) * (float)config->flicker_data[i].base_val;
                         config->flicker_data[i].val_ema = (uint8_t)y_init;
@@ -531,17 +535,121 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                     }
                 }
 
-                // 基準色が変更された可能性があるので、RGB → HSV 変換を実行してキャッシュを更新
-                rgb_to_hsv(base_r, base_g, base_b,
-                           &config->flicker_data[led_idx].base_hue,
-                           &config->flicker_data[led_idx].base_sat,
-                           &config->flicker_data[led_idx].base_val);
-
                 // パラメータ取得
                 uint8_t speed = pattern->pattern_param1;   // 1..255 (0 のときはデフォルト)
                 if (speed == 0) speed = 128;
                 uint8_t range = pattern->pattern_param2;   // 1..255 (0 のときはデフォルト)
                 if (range == 0) range = 128;
+
+                // FLICKER1: GPIO 共有状態を使用
+                if (pattern->pattern_type == WS2812B_PATTERN_FLICKER1)
+                {
+                    led_flicker_data_t *fd = &config->gpio_flicker1_shared;
+
+                    // 基準色の HSV を計算 (LED ごとに異なる可能性がある)
+                    uint16_t base_hue;
+                    uint8_t base_sat, base_val;
+                    rgb_to_hsv(base_r, base_g, base_b, &base_hue, &base_sat, &base_val);
+
+                    // base_val=0 (黒) の場合、消灯を維持
+                    if (base_val == 0)
+                    {
+                        r = 0;
+                        g = 0;
+                        b = 0;
+                        update_this_led = true;
+                        break;
+                    }
+
+                    // 間欠カオス法による 1/f ゆらぎ
+                    if (fd->count == 0)
+                    {
+                        // 間欠カオス法: 状態変数 x を更新 (明度用)
+                        if (fd->x < 0.5f)
+                        {
+                            fd->x = fd->x + 2.0f * fd->x * fd->x;
+                        }
+                        else
+                        {
+                            fd->x = fd->x - 2.0f * (1.0f - fd->x) * (1.0f - fd->x);
+                        }
+
+                        // 最小値・最大値への張り付きを防ぐため、乱数で離す
+                        if (fd->x < 0.005f)
+                        {
+                            fd->x += (float)(flicker_rand(&fd->seed) % 1000) / 10000.0f;
+                        }
+                        else if (fd->x > 0.995f)
+                        {
+                            fd->x -= (float)(flicker_rand(&fd->seed) % 1000) / 10000.0f;
+                        }
+                    }
+
+                    // base_val から正規化 (0-1 範囲) された y を計算
+                    // val_ema は前回の出力値なので、base_val で正規化して 0-1 範囲に戻す
+                    // ただし、base_val が変更された可能性があるため、現在の base_val を使う
+                    float y_normalized = 0.5f;  // 初期値
+                    if (base_val > 0)
+                    {
+                        // val_ema は基準色に対する EMA 値だが、FLICKER1 では各 LED の base_val が異なる
+                        // ため、共有状態の x から直接計算する
+                        y_normalized = fd->x;  // 共有状態の x をそのまま使用
+                    }
+
+                    float maxloop_f = (float)fd->maxloop;
+                    y_normalized = y_normalized * (1.0f - 1.0f / maxloop_f) + fd->x * (1.0f / maxloop_f);
+
+                    // range パラメータで変化幅を調整 (0-1 の範囲で)
+                    float range_factor = (float)range / 128.0f;
+                    y_normalized = 0.5f + (y_normalized - 0.5f) * range_factor;
+
+                    // 0-1 にクリップ
+                    if (y_normalized < 0.0f) y_normalized = 0.0f;
+                    if (y_normalized > 1.0f) y_normalized = 1.0f;
+
+                    // PWM 範囲 62.5%-100% を base_val に適用
+                    // 出力 = (y * 96/256 + 160/256) * base_val = (y * 0.375 + 0.625) * base_val
+                    float val_out = (y_normalized * 0.375f + 0.625f) * (float)base_val;
+                    if (val_out > 255.0f) val_out = 255.0f;
+
+                    uint8_t final_val = (uint8_t)val_out;
+
+                    // カウンタを更新 (GPIO 共有)
+                    fd->count++;
+                    if (fd->count > fd->maxloop)
+                    {
+                        fd->count = 0;
+
+                        // 移行スピードを乱数で調整 (speed パラメータで調整)
+                        // speed が低いほど maxloop が大きくなり、変化が遅くなる
+                        uint8_t base_maxloop = 14 - (speed / 32);  // 6..14 程度の範囲
+                        if (base_maxloop < 3) base_maxloop = 3;
+                        fd->maxloop = (flicker_rand(&fd->seed) % 9) + base_maxloop;
+                    }
+
+                    // 色相ゆらぎなし (基準色をそのまま使用)
+                    uint8_t s_now = base_sat;
+                    uint16_t h_now = base_hue;
+
+                    // HSV → RGB (全体輝度を反映) → ガンマ補正
+                    uint8_t v_final = (uint8_t)(((uint32_t)final_val * config->brightness) / 255);
+                    uint32_t rgb = ws2812b_color_hsv(h_now, s_now, v_final);
+                    rgb = gamma32(rgb);
+
+                    // 出力 RGB を取り出す
+                    r = (rgb >> 16) & 0xFF;
+                    g = (rgb >>  8) & 0xFF;
+                    b = rgb & 0xFF;
+
+                    break;
+                }
+
+                // FLICKER2/3: LED ごとの状態を使用
+                // 基準色が変更される可能性があるので、RGB → HSV 変換を実行してキャッシュを更新
+                rgb_to_hsv(base_r, base_g, base_b,
+                           &config->flicker_data[led_idx].base_hue,
+                           &config->flicker_data[led_idx].base_sat,
+                           &config->flicker_data[led_idx].base_val);
 
                 led_flicker_data_t *fd = &config->flicker_data[led_idx];
 
@@ -555,10 +663,10 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                     break;
                 }
 
-                // 間欠カオス法による 1/f ゆらぎ (参考\main.c のアルゴリズム)
+                // 間欠カオス法による 1/f ゆらぎ
                 if (fd->count == 0)
                 {
-                    // 間欠カオス法: 状態変数 x を更新（明度用）
+                    // 間欠カオス法: 状態変数 x を更新 (明度用)
                     if (fd->x < 0.5f)
                     {
                         fd->x = fd->x + 2.0f * fd->x * fd->x;
@@ -578,20 +686,19 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                         fd->x -= (float)(flicker_rand(&fd->seed) % 1000) / 10000.0f;
                     }
 
+                    // FLICKER3: 色相用の目標値を更新 (明度とは独立したランダムウォーク)
+                    if (pattern->pattern_type == WS2812B_PATTERN_FLICKER3)
+                    {
 #if WS2812B_FLICKER_HUE_VARIATION > 0
-                    // 色相用の目標値を更新（明度とは独立したランダムウォーク）
-                    int16_t hue_delta = ((int16_t)flicker_rand(&fd->seed) - 128) / 2;  // -64 - +63
-                    fd->hue_offset_target += (float)hue_delta / 256.0f;
+                        int16_t hue_delta = ((int16_t)flicker_rand(&fd->seed) - 128) / 2;  // -64 - +63
+                        fd->hue_offset_target += (float)hue_delta / 256.0f;
 
-                    // -0.5 - +0.5 の範囲にクリップ
-                    if (fd->hue_offset_target < -0.5f) fd->hue_offset_target = -0.5f;
-                    if (fd->hue_offset_target > 0.5f) fd->hue_offset_target = 0.5f;
+                        // -0.5 - +0.5 の範囲にクリップ
+                        if (fd->hue_offset_target < -0.5f) fd->hue_offset_target = -0.5f;
+                        if (fd->hue_offset_target > 0.5f) fd->hue_offset_target = 0.5f;
 #endif
+                    }
                 }
-
-                // 光の増減がスムーズになるよう徐々に明るさを切り替える
-                // PIC版との互換性: y と x は両方 0-1 の範囲で管理
-                // y = y * (1 - 1/maxloop) + x * 1/maxloop
 
                 // val_ema から y_normalized に逆変換
                 // val_ema = (y_normalized * 0.375 + 0.625) * base_val
@@ -602,7 +709,6 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                 y_normalized = y_normalized * (1.0f - 1.0f / maxloop_f) + fd->x * (1.0f / maxloop_f);
 
                 // range パラメータで変化幅を調整 (0-1 の範囲で)
-                // range=128 のとき range_factor=1.0 で PIC 版と同じ動作
                 float range_factor = (float)range / 128.0f;
                 y_normalized = 0.5f + (y_normalized - 0.5f) * range_factor;
 
@@ -625,30 +731,36 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                     fd->count = 0;
 
                     // 移行スピードを乱数で調整 (speed パラメータで調整)
-                    // 参考\main.c との互換性: 20ms × (3-11) = 10ms × (6-22)
                     // speed が低いほど maxloop が大きくなり、変化が遅くなる
-                    // speed=128 (デフォルト) で参考\main.c と同じ速度 (平均 140ms)
                     uint8_t base_maxloop = 14 - (speed / 32);  // 6..14 程度の範囲
                     if (base_maxloop < 3) base_maxloop = 3;
                     fd->maxloop = (flicker_rand(&fd->seed) % 9) + base_maxloop;
                 }
 
-                // 色相のゆらぎ (WS2812B_FLICKER_HUE_VARIATION で制御)
+                // 色相のゆらぎ (FLICKER3 のみ)
+                if (pattern->pattern_type == WS2812B_PATTERN_FLICKER3)
+                {
 #if WS2812B_FLICKER_HUE_VARIATION > 0
-                // 色相オフセットを目標値に向かって平滑化（明度とは独立）
-                float alpha_hue = 0.30f;  // 色相の平滑化係数（明度と同程度の速度）
-                fd->hue_offset += alpha_hue * (fd->hue_offset_target - fd->hue_offset);
+                    // 色相オフセットを目標値に向かって平滑化 (明度とは独立)
+                    float alpha_hue = 0.30f;  // 色相の平滑化係数 (明度と同程度の速度)
+                    fd->hue_offset += alpha_hue * (fd->hue_offset_target - fd->hue_offset);
 
-                // range パラメータと係数を適用
-                int16_t hue_offset_scaled = (int16_t)(fd->hue_offset * (float)range * (float)WS2812B_FLICKER_HUE_VARIATION);
-                int32_t hue_val = (int32_t)fd->base_hue + hue_offset_scaled;
-                if (hue_val < 0) hue_val += 65536;
-                if (hue_val > 65535) hue_val -= 65536;
-                fd->hue_ema = (uint16_t)hue_val;
+                    // range パラメータと係数を適用
+                    int16_t hue_offset_scaled = (int16_t)(fd->hue_offset * (float)range * (float)WS2812B_FLICKER_HUE_VARIATION);
+                    int32_t hue_val = (int32_t)fd->base_hue + hue_offset_scaled;
+                    if (hue_val < 0) hue_val += 65536;
+                    if (hue_val > 65535) hue_val -= 65536;
+                    fd->hue_ema = (uint16_t)hue_val;
 #else
-                // 色相ゆらぎ無効時は基準値を維持
-                fd->hue_ema = fd->base_hue;
+                    // WS2812B_FLICKER_HUE_VARIATION が 0 の場合
+                    fd->hue_ema = fd->base_hue;
 #endif
+                }
+                else
+                {
+                    // FLICKER2: 色相ゆらぎなし、基準値を維持
+                    fd->hue_ema = fd->base_hue;
+                }
 
                 // 彩度は基準値を維持
                 uint8_t s_now = fd->base_sat;
@@ -1008,6 +1120,19 @@ esp_err_t ws2812b_enable(uint8_t pin, uint16_t num_leds, uint8_t brightness, ser
     // flicker_data は NULL で初期化 (必要に応じて動的割り当て)
     ws2812b_configs[pin].flicker_data = NULL;
 
+    // FLICKER1 用の GPIO 共有状態を初期化
+    ws2812b_configs[pin].gpio_flicker1_shared.base_hue = 0;
+    ws2812b_configs[pin].gpio_flicker1_shared.base_sat = 0;
+    ws2812b_configs[pin].gpio_flicker1_shared.base_val = 0;
+    ws2812b_configs[pin].gpio_flicker1_shared.seed = (uint32_t)pin * 12345 + 67890;
+    ws2812b_configs[pin].gpio_flicker1_shared.val_ema = 0;
+    ws2812b_configs[pin].gpio_flicker1_shared.hue_ema = 0;
+    ws2812b_configs[pin].gpio_flicker1_shared.x = 0.5f;
+    ws2812b_configs[pin].gpio_flicker1_shared.count = 0;
+    ws2812b_configs[pin].gpio_flicker1_shared.maxloop = 10;
+    ws2812b_configs[pin].gpio_flicker1_shared.hue_offset = 0.0f;
+    ws2812b_configs[pin].gpio_flicker1_shared.hue_offset_target = 0.0f;
+
     portMUX_TYPE *mutex = main_get_gpio_states_mutex();
     bleio_gpio_state_t *state = main_get_gpio_state(pin);
 
@@ -1152,8 +1277,8 @@ esp_err_t ws2812b_set_pattern(uint8_t pin, uint8_t led_index,
 
     ws2812b_config_t *config = &ws2812b_configs[pin];
 
-    // パターンタイプの検証 (0-4 および 0xFF (UNSET) を許可)
-    if (pattern_type > WS2812B_PATTERN_FLICKER && pattern_type != WS2812B_PATTERN_UNSET)
+    // パターンタイプの検証 (0-6 および 0xFF (UNSET) を許可)
+    if (pattern_type > WS2812B_PATTERN_FLICKER3 && pattern_type != WS2812B_PATTERN_UNSET)
     {
         ESP_LOGE(TAG, "Invalid pattern type: %d", pattern_type);
         return ESP_ERR_INVALID_ARG;

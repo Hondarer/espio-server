@@ -19,7 +19,9 @@
 #define WS2812B_PATTERN_BLINK_250MS 1   // 250ms 点灯 / 250ms 消灯
 #define WS2812B_PATTERN_BLINK_500MS 2   // 500ms 点灯 / 500ms 消灯
 #define WS2812B_PATTERN_RAINBOW 3       // 虹色パターン
-#define WS2812B_PATTERN_FLICKER 4       // 炎のゆらめきパターン
+#define WS2812B_PATTERN_FLICKER1 4      // 炎のゆらめきパターン (GPIO 共有明度、色相ゆらぎなし)
+#define WS2812B_PATTERN_FLICKER2 5      // 炎のゆらめきパターン (LED 個別明度、色相ゆらぎなし)
+#define WS2812B_PATTERN_FLICKER3 6      // 炎のゆらめきパターン (LED 個別明度、色相ゆらぎあり)
 #define WS2812B_PATTERN_UNSET 0xFF      // 未設定 (個別 LED パターン用)
 
 // FLICKER パターンの色相ゆらぎ係数
@@ -72,7 +74,8 @@ typedef struct
     ws2812b_led_pattern_t gpio_pattern; // GPIO 全体のデフォルトパターン (LED 番号 0)
     ws2812b_led_pattern_t *led_patterns; // LED 個別のパターン配列 (num_leds 個、動的割り当て)
     uint8_t *base_colors;               // LED ごとのベースカラー (RGB 形式、3 バイト × num_leds)
-    led_flicker_data_t *flicker_data;   // FLICKER パターン用のデータ (num_leds 個、動的割り当て)
+    led_flicker_data_t *flicker_data;   // FLICKER2/3 パターン用のデータ (num_leds 個、動的割り当て)
+    led_flicker_data_t gpio_flicker1_shared; // FLICKER1 用の GPIO 共有状態
 } ws2812b_config_t;
 
 // WS2812B 制御
