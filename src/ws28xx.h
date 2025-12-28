@@ -58,6 +58,7 @@ typedef struct
     uint8_t maxloop;        // 明度移行目標値
     float hue_offset;       // 色相オフセットの平滑値 (-1.0-1.0)
     float hue_offset_target; // 色相オフセットの目標値 (-1.0-1.0)
+    float y_prev;           // 前回の y_normalized 値 (FLICKER1 用、0.0-1.0)
 } led_flicker_data_t;
 
 // WS2812B 設定保持用構造体
@@ -76,6 +77,8 @@ typedef struct
     uint8_t *base_colors;               // LED ごとのベースカラー (RGB 形式、3 バイト × num_leds)
     led_flicker_data_t *flicker_data;   // FLICKER2/3 パターン用のデータ (num_leds 個、動的割り当て)
     led_flicker_data_t gpio_flicker1_shared; // FLICKER1 用の GPIO 共有状態
+    uint8_t flicker1_speed;             // FLICKER1 用の GPIO 共有速度パラメータ (最後に設定された値)
+    uint8_t flicker1_range;             // FLICKER1 用の GPIO 共有変化幅パラメータ (最後に設定された値)
 } ws2812b_config_t;
 
 // WS2812B 制御

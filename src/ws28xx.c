@@ -535,15 +535,17 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                     }
                 }
 
-                // パラメータ取得
-                uint8_t speed = pattern->pattern_param1;   // 1..255 (0 のときはデフォルト)
-                if (speed == 0) speed = 128;
-                uint8_t range = pattern->pattern_param2;   // 1..255 (0 のときはデフォルト)
-                if (range == 0) range = 128;
-
                 // FLICKER1: GPIO 共有状態を使用
                 if (pattern->pattern_type == WS2812B_PATTERN_FLICKER1)
                 {
+                    // FLICKER1 のパラメータを GPIO 共有パラメータに保存 (最後に処理された値を使用)
+                    uint8_t speed = pattern->pattern_param1;
+                    if (speed == 0) speed = 128;
+                    uint8_t range = pattern->pattern_param2;
+                    if (range == 0) range = 128;
+                    config->flicker1_speed = speed;
+                    config->flicker1_range = range;
+
                     led_flicker_data_t *fd = &config->gpio_flicker1_shared;
 
                     // 基準色の HSV を計算 (LED ごとに異なる可能性がある)
@@ -585,27 +587,24 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                         }
                     }
 
-                    // base_val から正規化 (0-1 範囲) された y を計算
-                    // val_ema は前回の出力値なので、base_val で正規化して 0-1 範囲に戻す
-                    // ただし、base_val が変更された可能性があるため、現在の base_val を使う
-                    float y_normalized = 0.5f;  // 初期値
-                    if (base_val > 0)
-                    {
-                        // val_ema は基準色に対する EMA 値だが、FLICKER1 では各 LED の base_val が異なる
-                        // ため、共有状態の x から直接計算する
-                        y_normalized = fd->x;  // 共有状態の x をそのまま使用
-                    }
+                    // 前回の y_normalized から EMA 計算
+                    // FLICKER1 は GPIO 全体で y_normalized を共有するため、
+                    // 各 LED の base_val に依存せず、正規化された値 (0-1) で計算する
+                    float y_normalized = fd->y_prev;  // 前回の y_normalized を使用
 
                     float maxloop_f = (float)fd->maxloop;
                     y_normalized = y_normalized * (1.0f - 1.0f / maxloop_f) + fd->x * (1.0f / maxloop_f);
 
-                    // range パラメータで変化幅を調整 (0-1 の範囲で)
-                    float range_factor = (float)range / 128.0f;
+                    // range パラメータで変化幅を調整 (0-1 の範囲で) - GPIO 共有パラメータを使用
+                    float range_factor = (float)config->flicker1_range / 128.0f;
                     y_normalized = 0.5f + (y_normalized - 0.5f) * range_factor;
 
                     // 0-1 にクリップ
                     if (y_normalized < 0.0f) y_normalized = 0.0f;
                     if (y_normalized > 1.0f) y_normalized = 1.0f;
+
+                    // range 調整後の y_normalized を保存 (FLICKER2 と同じ動作にする)
+                    fd->y_prev = y_normalized;
 
                     // PWM 範囲 62.5%-100% を base_val に適用
                     // 出力 = (y * 96/256 + 160/256) * base_val = (y * 0.375 + 0.625) * base_val
@@ -620,9 +619,9 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                     {
                         fd->count = 0;
 
-                        // 移行スピードを乱数で調整 (speed パラメータで調整)
+                        // 移行スピードを乱数で調整 (speed パラメータで調整) - GPIO 共有パラメータを使用
                         // speed が低いほど maxloop が大きくなり、変化が遅くなる
-                        uint8_t base_maxloop = 14 - (speed / 32);  // 6..14 程度の範囲
+                        uint8_t base_maxloop = 14 - (config->flicker1_speed / 32);  // 6..14 程度の範囲
                         if (base_maxloop < 3) base_maxloop = 3;
                         fd->maxloop = (flicker_rand(&fd->seed) % 9) + base_maxloop;
                     }
@@ -645,6 +644,12 @@ void ws2812b_update_patterns(uint8_t blink_counter)
                 }
 
                 // FLICKER2/3: LED ごとの状態を使用
+                // パラメータ取得 (LED ごとに独立)
+                uint8_t speed = pattern->pattern_param1;
+                if (speed == 0) speed = 128;
+                uint8_t range = pattern->pattern_param2;
+                if (range == 0) range = 128;
+
                 // 基準色が変更される可能性があるので、RGB → HSV 変換を実行してキャッシュを更新
                 rgb_to_hsv(base_r, base_g, base_b,
                            &config->flicker_data[led_idx].base_hue,
@@ -1132,6 +1137,11 @@ esp_err_t ws2812b_enable(uint8_t pin, uint16_t num_leds, uint8_t brightness, ser
     ws2812b_configs[pin].gpio_flicker1_shared.maxloop = 10;
     ws2812b_configs[pin].gpio_flicker1_shared.hue_offset = 0.0f;
     ws2812b_configs[pin].gpio_flicker1_shared.hue_offset_target = 0.0f;
+    ws2812b_configs[pin].gpio_flicker1_shared.y_prev = 0.5f;
+
+    // FLICKER1 用の GPIO 共有パラメータを初期化
+    ws2812b_configs[pin].flicker1_speed = 128;  // デフォルト速度
+    ws2812b_configs[pin].flicker1_range = 128;  // デフォルト変化幅
 
     portMUX_TYPE *mutex = main_get_gpio_states_mutex();
     bleio_gpio_state_t *state = main_get_gpio_state(pin);
